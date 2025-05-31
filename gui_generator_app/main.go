@@ -4,10 +4,12 @@ package main
 import (
 	"context"
 	"fmt"
+	"image/color" // Import for color definitions
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -15,13 +17,100 @@ import (
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
 	"github.com/RIZAmohammadkhan/GuiKeyStandaloneGo/gui_generator_app/generator/core"
 	"github.com/RIZAmohammadkhan/GuiKeyStandaloneGo/gui_generator_app/pkg/config"
 )
 
+// --- Custom Theme Definition ---
+
+// Define our custom colors
+var (
+	colorBeige           = color.NRGBA{R: 0xF5, G: 0xF5, B: 0xDC, A: 0xff} // Main background
+	colorSoftBlack       = color.NRGBA{R: 0x21, G: 0x21, B: 0x21, A: 0xff} // Text
+	colorLightBrown      = color.NRGBA{R: 0xD2, G: 0xB4, B: 0x8C, A: 0xff} // Progress track, borders
+	colorDarkBrown       = color.NRGBA{R: 0x8B, G: 0x45, B: 0x13, A: 0xff} // Progress value, primary
+	colorMediumBrown     = color.NRGBA{R: 0xA0, G: 0x52, B: 0x2D, A: 0xff} // Hover
+	colorMutedGrayBrown  = color.NRGBA{R: 0x9B, G: 0x87, B: 0x70, A: 0xff} // Disabled text, placeholder
+	colorInputBackground = color.NRGBA{R: 0xFA, G: 0xF0, B: 0xE6, A: 0xff} // Linen for input fields
+	colorCardBackground  = color.NRGBA{R: 0xFD, G: 0xF5, B: 0xE6, A: 0xff} // Old Lace, slightly off-beige for cards
+)
+
+// Custom Theme Definition - Compatible with older Fyne versions
+type myAppTheme struct {
+	fyne.Theme // Embed default theme (LightTheme in this case)
+}
+
+func newAppTheme() fyne.Theme {
+	return &myAppTheme{Theme: theme.LightTheme()}
+}
+
+func (m *myAppTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVariant) color.Color {
+	// We are building a light theme, so we mostly ignore 'variant' or handle it minimally.
+	// If you wanted a dark variant of this theme, you'd check theme.VariantDark.
+
+	switch name {
+	case theme.ColorNameBackground:
+		return colorBeige
+	case theme.ColorNameButton: // Standard button face color
+		return colorBeige // Could be a slightly different beige or light brown
+	case theme.ColorNameDisabledButton:
+		// A more desaturated/lighter version of the button color or light brown
+		return color.NRGBA{R: 0xE0, G: 0xD5, B: 0xC0, A: 0xff}
+	case theme.ColorNameDisabled:
+		return colorMutedGrayBrown
+	case theme.ColorNameError:
+		return m.Theme.Color(name, variant) // Inherit error color from base LightTheme
+	case theme.ColorNameFocus: // Focus highlight (e.g., around input fields)
+		return colorDarkBrown
+	case theme.ColorNameForeground: // Main text color
+		return colorSoftBlack
+	case theme.ColorNameHover: // Hover over interactive elements
+		return colorMediumBrown
+	case theme.ColorNameInputBackground:
+		return colorInputBackground
+	case theme.ColorNameInputBorder:
+		return colorLightBrown
+	case theme.ColorNamePlaceHolder:
+		return colorMutedGrayBrown
+	case theme.ColorNamePrimary: // Primary actions, progress bar value (fallback)
+		return colorDarkBrown
+	case theme.ColorNameScrollBar:
+		return colorLightBrown
+	case theme.ColorNameShadow:
+		// A subtle darker beige or very light brown for shadows
+		return color.NRGBA{R: 0xD3, G: 0xC8, B: 0xB6, A: 0x60} // Softer shadow
+	case theme.ColorNameSelection: // Text selection background
+		return color.NRGBA{R: 0xD2, G: 0xB4, B: 0x8C, A: 0x80} // LightBrown with some transparency
+	case theme.ColorNameSuccess:
+		return m.Theme.Color(name, variant) // Inherit success color
+	case theme.ColorNameWarning:
+		return m.Theme.Color(name, variant) // Inherit warning color
+	default:
+		// Fall back to the embedded theme (LightTheme) for any unhandled color names
+		return m.Theme.Color(name, variant)
+	}
+}
+
+// Implement other fyne.Theme interface methods by delegating to the embedded theme
+func (m *myAppTheme) Font(style fyne.TextStyle) fyne.Resource {
+	return m.Theme.Font(style)
+}
+
+func (m *myAppTheme) Icon(name fyne.ThemeIconName) fyne.Resource {
+	return m.Theme.Icon(name)
+}
+
+func (m *myAppTheme) Size(name fyne.ThemeSizeName) float32 {
+	return m.Theme.Size(name)
+}
+
+// --- End Custom Theme Definition ---
+
 type guiApp struct {
+	// ... (rest of your guiApp struct remains the same)
 	fyneApp fyne.App
 	mainWin fyne.Window
 
@@ -44,14 +133,20 @@ type guiApp struct {
 	genProgressBar *widget.ProgressBar
 
 	// Results Section
-	resultsCard      *widget.Card
-	readmeDisplay    *widget.Entry
-	openOutputButton *widget.Button
-	finishButton     *widget.Button
+	resultsCard            *widget.Card
+	resultsTitleLabel      *widget.Label
+	resultsPeerIDText      *widget.Label
+	peerIDInfoDisplay      *widget.Entry
+	copyPeerIDButton       *widget.Button
+	resultsOutputPathLabel *widget.Label
+	readmeDisplay          *widget.Label // Changed from Entry to Label
+	openOutputButton       *widget.Button
+	finishButton           *widget.Button
+	cleanupStatusLabel     *widget.Label // For "Cleaning up..." message
 
 	// Shared data
 	extractedGoExePath     string
-	extractedTemplatesPath string // This will hold the temporary module root path
+	extractedTemplatesPath string
 	cleanupGoSdkFunc       func() error
 	cleanupTemplatesFunc   func() error
 	selectedOutputDir      string
@@ -59,9 +154,13 @@ type guiApp struct {
 
 	operationCtx    context.Context
 	operationCancel context.CancelFunc
+
+	isShuttingDown bool
+	shutdownMutex  sync.Mutex
 }
 
 func main() {
+	// ... (logging setup remains the same)
 	configDir, err := os.UserConfigDir()
 	if err != nil {
 		log.Fatalf("Failed to get user config directory: %v", err)
@@ -81,6 +180,7 @@ func main() {
 	log.Printf("[main] Application starting with embedded resources. Logging to %s\n", logFilePath)
 
 	fa := app.NewWithID("com.rizamohammadkhan.guikeygen.embed")
+	fa.Settings().SetTheme(newAppTheme()) // APPLY THE CUSTOM THEME
 	w := fa.NewWindow("GuiKey Standalone Package Generator")
 
 	ui := &guiApp{
@@ -89,16 +189,14 @@ func main() {
 	}
 
 	w.SetCloseIntercept(func() {
-		log.Println("[main] Window close intercepted. Performing resource cleanup...")
-		ui.cleanupResources()
-		w.Close()
+		log.Println("[main] Window close intercepted.")
+		ui.triggerShutdown()
 	})
 
 	ui.setupUI()
-	w.Resize(fyne.NewSize(800, 700))
+	w.Resize(fyne.NewSize(800, 750))
 	w.CenterOnScreen()
 
-	// Start environment preparation immediately
 	go ui.prepareEnvironment()
 
 	log.Print("[main] Entering Fyne main loop")
@@ -109,26 +207,30 @@ func main() {
 func (ui *guiApp) setupUI() {
 	log.Print("[ui] Setting up single page UI")
 
-	// 1. Environment Preparation Section
+	// Environment Preparation Section
 	ui.prepStatusLabel = widget.NewLabel("Initializing: Preparing required resources...")
 	ui.prepProgressBar = widget.NewProgressBar()
 	ui.prepProgressBar.SetValue(0)
 	ui.prepErrorLabel = widget.NewLabel("")
 	ui.prepErrorLabel.Hide()
+	ui.cleanupStatusLabel = widget.NewLabel("")
+	ui.cleanupStatusLabel.Alignment = fyne.TextAlignCenter
+	ui.cleanupStatusLabel.Hide()
 
 	prepContent := container.NewVBox(
 		ui.prepStatusLabel,
 		ui.prepProgressBar,
 		ui.prepErrorLabel,
+		ui.cleanupStatusLabel,
 	)
 	ui.prepCard = widget.NewCard("Environment Setup", "", prepContent)
 
-	// 2. Configuration Section (Initially disabled)
+	// Configuration Section
 	ui.outputDirEntry = widget.NewEntry()
-	ui.outputDirEntry.SetPlaceHolder("Output directory will be selected here...")
+	ui.outputDirEntry.SetPlaceHolder("Select output directory...")
 	ui.outputDirEntry.Disable()
 
-	ui.browseButton = widget.NewButton("Browse...", func() {
+	ui.browseButton = widget.NewButtonWithIcon("Browse...", theme.FolderOpenIcon(), func() {
 		dialog.ShowFolderOpen(func(uri fyne.ListableURI, err error) {
 			if err != nil {
 				log.Printf("[ui-cfg] FolderOpenDialog error: %v", err)
@@ -153,9 +255,10 @@ func (ui *guiApp) setupUI() {
 	ui.bootstrapAddrsEntry.SetMinRowsVisible(3)
 	ui.bootstrapAddrsEntry.Disable()
 
-	ui.generateButton = widget.NewButton("Generate Packages", func() {
+	ui.generateButton = widget.NewButtonWithIcon("Generate Packages", theme.ConfirmIcon(), func() {
 		ui.startGeneration()
 	})
+	ui.generateButton.Importance = widget.HighImportance // Make it use PrimaryColor
 	ui.generateButton.Disable()
 
 	outputDirBox := container.NewBorder(nil, nil, nil, ui.browseButton, ui.outputDirEntry)
@@ -169,7 +272,7 @@ func (ui *guiApp) setupUI() {
 	)
 	ui.configCard = widget.NewCard("Configuration", "Configure package generation settings", configContent)
 
-	// 3. Generation Progress Section (Initially hidden)
+	// Generation Progress Section
 	ui.genStatusLabel = widget.NewLabel("Generation will start here...")
 	ui.genProgressBar = widget.NewProgressBar()
 	ui.genProgressBar.SetValue(0)
@@ -181,25 +284,48 @@ func (ui *guiApp) setupUI() {
 	ui.genCard = widget.NewCard("Generation Progress", "", genContent)
 	ui.genCard.Hide()
 
-	// 4. Results Section (Initially hidden)
-	ui.readmeDisplay = widget.NewMultiLineEntry()
-	ui.readmeDisplay.Wrapping = fyne.TextWrapWord
-	ui.readmeDisplay.Disable()
+	// Results Section
+	ui.resultsTitleLabel = widget.NewLabel("Generation Status")
+	ui.resultsTitleLabel.TextStyle.Bold = true
+	ui.resultsTitleLabel.Alignment = fyne.TextAlignCenter
 
-	ui.openOutputButton = widget.NewButton("Open Output Folder", func() {
+	ui.resultsPeerIDText = widget.NewLabel("Server PeerID:")
+	ui.peerIDInfoDisplay = widget.NewEntry()
+	ui.peerIDInfoDisplay.Disable()
+	ui.peerIDInfoDisplay.Hide()
+
+	ui.copyPeerIDButton = widget.NewButtonWithIcon("Copy", theme.ContentCopyIcon(), func() {
+		currentPeerID := ui.peerIDInfoDisplay.Text
+		if currentPeerID != "" && currentPeerID != "Not available" {
+			ui.mainWin.Clipboard().SetContent(currentPeerID)
+			log.Printf("[ui] Copied PeerID to clipboard: %s", currentPeerID)
+		}
+	})
+	ui.copyPeerIDButton.Hide()
+
+	hscrollPeerID := container.NewHScroll(ui.peerIDInfoDisplay)
+	peerIDLine := container.NewBorder(nil, nil, ui.resultsPeerIDText, ui.copyPeerIDButton, hscrollPeerID)
+
+	ui.resultsOutputPathLabel = widget.NewLabel("Output Path: ")
+	ui.resultsOutputPathLabel.Wrapping = fyne.TextWrapBreak
+
+	ui.readmeDisplay = widget.NewLabel("")
+	ui.readmeDisplay.Wrapping = fyne.TextWrapWord
+
+	readmeScroll := container.NewScroll(ui.readmeDisplay)
+	readmeScroll.SetMinSize(fyne.NewSize(0, 250))
+
+	ui.openOutputButton = widget.NewButtonWithIcon("Open Output Folder", theme.FolderIcon(), func() {
 		if ui.generatedInfo.FullOutputDir != "" {
-			dialog.ShowInformation("Open Folder", "Please navigate to:\n"+ui.generatedInfo.FullOutputDir, ui.mainWin)
+			dialog.ShowInformation("Output Folder Location",
+				"Packages generated in:\n"+ui.generatedInfo.FullOutputDir+"\n\nPlease navigate there using your file explorer.", ui.mainWin)
 		}
 	})
 
-	ui.finishButton = widget.NewButton("Finish", func() {
-		log.Print("[ui] Finish button clicked, cleaning up and exiting")
-		ui.cleanupResources()
-		ui.fyneApp.Quit()
+	ui.finishButton = widget.NewButtonWithIcon("Finish", theme.LogoutIcon(), func() {
+		log.Print("[ui] Finish button clicked.")
+		ui.triggerShutdown()
 	})
-
-	readmeScroll := container.NewScroll(ui.readmeDisplay)
-	readmeScroll.SetMinSize(fyne.NewSize(0, 200))
 
 	buttonBox := container.NewHBox(
 		layout.NewSpacer(),
@@ -209,14 +335,19 @@ func (ui *guiApp) setupUI() {
 	)
 
 	resultsContent := container.NewVBox(
-		widget.NewLabel("Generation completed successfully! Instructions:"),
+		ui.resultsTitleLabel,
+		widget.NewSeparator(),
+		peerIDLine,
+		ui.resultsOutputPathLabel,
+		widget.NewSeparator(),
+		widget.NewLabelWithStyle("Instructions & Details:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		readmeScroll,
+		layout.NewSpacer(),
 		buttonBox,
 	)
 	ui.resultsCard = widget.NewCard("Results", "", resultsContent)
 	ui.resultsCard.Hide()
 
-	// Main layout - all sections in one scrollable container
 	mainContent := container.NewVBox(
 		ui.prepCard,
 		ui.configCard,
@@ -228,6 +359,11 @@ func (ui *guiApp) setupUI() {
 	ui.mainWin.SetContent(container.NewPadded(scrollContainer))
 }
 
+// ... (rest of your methods: prepareEnvironment, updatePrepStatus, handlePrepError, enableConfigurationSection, startGeneration, performGeneration, updateGenStatus, handleGenError, showResults, cleanupResources, triggerShutdown)
+// Ensure these methods remain as they were in the previous correct version, using fyne.Do for UI updates from goroutines.
+// For brevity, I'm not repeating them here, but they should be the same as in the version before this theme change.
+// Make sure to copy them from the previous correct response. I will paste them below this block.
+
 func (ui *guiApp) prepareEnvironment() {
 	log.Println("[prep] Starting environment preparation")
 	ui.operationCtx, ui.operationCancel = context.WithCancel(context.Background())
@@ -236,9 +372,8 @@ func (ui *guiApp) prepareEnvironment() {
 		ui.updatePrepStatus("Preparing Go compiler...", 0)
 	})
 
-	// Step 1: Prepare Go SDK
 	goExe, cleanupGo, errGo := GetGoExecutablePath(ui.operationCtx, func(msg string, pct int) {
-		displayPct := int(float64(pct) * 0.5) // Go SDK prep is 0-50%
+		displayPct := int(float64(pct) * 0.5)
 		fyne.Do(func() { ui.updatePrepStatus(msg, displayPct) })
 	})
 
@@ -257,10 +392,8 @@ func (ui *guiApp) prepareEnvironment() {
 		ui.updatePrepStatus("Preparing source templates...", 50)
 	})
 
-	// Step 2: Prepare Templates using GetTemporaryModulePath
-	// templatesPath is the root of the temporary module
 	templatesPath, cleanupTpl, errTpl := GetTemporaryModulePath(ui.operationCtx, func(msg string, pct int) {
-		displayPct := 50 + int(float64(pct)*0.5) // Scale to 50-100%
+		displayPct := 50 + int(float64(pct)*0.5)
 		fyne.Do(func() { ui.updatePrepStatus(msg, displayPct) })
 	})
 
@@ -272,10 +405,9 @@ func (ui *guiApp) prepareEnvironment() {
 		}
 		return
 	}
-	ui.extractedTemplatesPath = templatesPath // This IS the temporary module root path
+	ui.extractedTemplatesPath = templatesPath
 	ui.cleanupTemplatesFunc = cleanupTpl
 
-	// Environment ready - enable configuration section
 	fyne.Do(func() {
 		ui.updatePrepStatus("Environment ready! You can now configure generation settings.", 100)
 		ui.enableConfigurationSection()
@@ -307,9 +439,8 @@ func (ui *guiApp) enableConfigurationSection() {
 	ui.browseButton.Enable()
 	ui.bootstrapAddrsEntry.Enable()
 	ui.generateButton.Enable()
-
-	// Update card title to show it's ready
 	ui.configCard.SetTitle("Configuration (Ready)")
+	ui.configCard.Refresh()
 }
 
 func (ui *guiApp) startGeneration() {
@@ -320,7 +451,6 @@ func (ui *guiApp) startGeneration() {
 		return
 	}
 
-	// Create directory if it doesn't exist
 	if _, err := os.Stat(ui.selectedOutputDir); os.IsNotExist(err) {
 		dialog.ShowConfirm("Create Directory?",
 			fmt.Sprintf("The output directory '%s' does not exist.\nWould you like to create it?", ui.selectedOutputDir),
@@ -342,13 +472,13 @@ func (ui *guiApp) startGeneration() {
 func (ui *guiApp) performGeneration() {
 	log.Print("[gen] Performing package generation")
 
-	// Show generation section and disable configuration
 	ui.genCard.Show()
 	ui.generateButton.Disable()
 	ui.browseButton.Disable()
 	ui.bootstrapAddrsEntry.Disable()
+	ui.outputDirEntry.Disable()
+	ui.configCard.Refresh()
 
-	// Process bootstrap addresses
 	bootstrapSplit := strings.FieldsFunc(ui.bootstrapAddrsEntry.Text, func(r rune) bool {
 		return r == ',' || r == '\n'
 	})
@@ -362,15 +492,12 @@ func (ui *guiApp) performGeneration() {
 	bootstrapFinal := strings.Join(bootstrapCleaned, ",")
 
 	go func() {
-		// ui.extractedTemplatesPath IS the temporary module root.
-		// TemplatesBasePath for core.PerformGeneration should be <temp_module_root>/generator/templates
 		templatesBasePath := filepath.Join(ui.extractedTemplatesPath, "generator", "templates")
-
 		settings := core.GeneratorSettings{
 			OutputDirPath:      ui.selectedOutputDir,
 			BootstrapAddresses: bootstrapFinal,
 			GoExecutablePath:   ui.extractedGoExePath,
-			TempModuleRootPath: ui.extractedTemplatesPath, // Pass the actual temporary module root
+			TempModuleRootPath: ui.extractedTemplatesPath,
 			TemplatesBasePath:  templatesBasePath,
 			ProgressCallback: func(message string, percentage int) {
 				fyne.Do(func() {
@@ -406,10 +533,11 @@ func (ui *guiApp) handleGenError(errMsg string) {
 	ui.genStatusLabel.SetText("Generation failed!")
 	dialog.ShowError(fmt.Errorf(errMsg), ui.mainWin)
 
-	// Re-enable configuration for retry
 	ui.generateButton.Enable()
 	ui.browseButton.Enable()
 	ui.bootstrapAddrsEntry.Enable()
+	ui.outputDirEntry.Enable()
+	ui.configCard.Refresh()
 }
 
 func (ui *guiApp) showResults() {
@@ -418,31 +546,45 @@ func (ui *guiApp) showResults() {
 	ui.genStatusLabel.SetText("Generation completed successfully!")
 	ui.genProgressBar.SetValue(1.0)
 
-	// Set up results display
 	if ui.generatedInfo.ReadmeContent == "" {
 		ui.readmeDisplay.SetText("Error: README content not available. Check logs.")
 	} else {
 		ui.readmeDisplay.SetText(ui.generatedInfo.ReadmeContent)
 	}
+	ui.readmeDisplay.Refresh()
 
-	// Update results card title with info
-	resultsTitle := "Results - Generation Complete!"
-	if ui.generatedInfo.FullOutputDir != "" {
-		resultsTitle += fmt.Sprintf("\nOutput: %s", filepath.Base(ui.generatedInfo.FullOutputDir))
-	}
+	ui.resultsTitleLabel.SetText("Generation Completed Successfully!")
+
 	if ui.generatedInfo.ServerPeerID != "" {
-		resultsTitle += fmt.Sprintf("\nServer PeerID: %s", ui.generatedInfo.ServerPeerID)
+		ui.peerIDInfoDisplay.SetText(ui.generatedInfo.ServerPeerID)
+		ui.copyPeerIDButton.Show()
+		ui.peerIDInfoDisplay.Show()
+	} else {
+		ui.peerIDInfoDisplay.SetText("Not available")
+		ui.copyPeerIDButton.Hide()
+		ui.peerIDInfoDisplay.Show()
 	}
-	ui.resultsCard.SetTitle(resultsTitle)
+	ui.peerIDInfoDisplay.Refresh()
+	ui.copyPeerIDButton.Refresh()
+
+	if ui.generatedInfo.FullOutputDir != "" {
+		ui.resultsOutputPathLabel.SetText(fmt.Sprintf("Output Path: %s", ui.generatedInfo.FullOutputDir))
+	} else {
+		ui.resultsOutputPathLabel.SetText("Output Path: Not available")
+	}
+	ui.resultsOutputPathLabel.Refresh()
 
 	ui.resultsCard.Show()
+	ui.resultsCard.Refresh()
 
-	// Scroll to results
 	time.AfterFunc(100*time.Millisecond, func() {
-		// This ensures the UI updates before scrolling
 		fyne.Do(func() {
-			if scroll, ok := ui.mainWin.Content().(*container.Scroll); ok {
-				scroll.ScrollToBottom()
+			if paddedContainer, ok := ui.mainWin.Content().(*fyne.Container); ok {
+				if len(paddedContainer.Objects) > 0 {
+					if scrollContainer, ok := paddedContainer.Objects[0].(*container.Scroll); ok {
+						scrollContainer.ScrollToBottom()
+					}
+				}
 			}
 		})
 	})
@@ -453,14 +595,66 @@ func (ui *guiApp) cleanupResources() {
 	if ui.operationCancel != nil {
 		ui.operationCancel()
 	}
+	log.Println("[cleanup] Cleaning up Go SDK...")
 	if ui.cleanupGoSdkFunc != nil {
 		if err := ui.cleanupGoSdkFunc(); err != nil {
 			log.Printf("[cleanup] Error cleaning up Go SDK: %v", err)
 		}
 	}
+	log.Println("[cleanup] Cleaning up templates...")
 	if ui.cleanupTemplatesFunc != nil {
 		if err := ui.cleanupTemplatesFunc(); err != nil {
 			log.Printf("[cleanup] Error cleaning up templates: %v", err)
 		}
 	}
+	log.Println("[cleanup] Resource cleanup attempt finished.")
+}
+
+func (ui *guiApp) triggerShutdown() {
+	ui.shutdownMutex.Lock()
+	if ui.isShuttingDown {
+		ui.shutdownMutex.Unlock()
+		log.Println("[shutdown] Shutdown already in progress.")
+		return
+	}
+	ui.isShuttingDown = true
+	ui.shutdownMutex.Unlock()
+
+	log.Println("[shutdown] Triggering application shutdown sequence.")
+
+	if ui.finishButton != nil {
+		ui.finishButton.Disable()
+	}
+	if ui.openOutputButton != nil {
+		ui.openOutputButton.Disable()
+	}
+	if ui.generateButton != nil {
+		ui.generateButton.Disable()
+	}
+	fyne.Do(func() {
+		if ui.cleanupStatusLabel != nil {
+			ui.cleanupStatusLabel.SetText("Cleaning up resources, please wait...\nThe application will close automatically.")
+			ui.cleanupStatusLabel.Show()
+		}
+		if ui.prepCard != nil {
+			ui.prepCard.Refresh()
+		}
+		if ui.configCard != nil {
+			ui.configCard.Hide()
+		}
+		if ui.genCard != nil {
+			ui.genCard.Hide()
+		}
+		if ui.resultsCard != nil {
+			ui.resultsCard.Hide()
+		}
+	})
+
+	go func() {
+		ui.cleanupResources()
+		fyne.Do(func() {
+			log.Println("[shutdown] Cleanup finished. Quitting application.")
+			ui.fyneApp.Quit()
+		})
+	}()
 }
