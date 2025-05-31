@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Download GenMon - Activity Monitor Suite</title>
-    <link rel="icon" type="image/png" href="/gui_generator_app/Icon.png">
+    <link rel="icon" type="image/png" href="gui_generator_app/Icon.png">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Creepster&family=Roboto:wght@400;700&display=swap" rel="stylesheet">
@@ -64,55 +64,60 @@
             border-radius: 15px;
             box-shadow: 0 5px 20px rgba(139, 69, 19, 0.2);
             border: 1px solid #D2B48C;
+            text-align: left;
         }
 
-        .content h2 { /* For "Behold! The Uncanny Abilities..." */
-            font-family: 'Roboto', Arial, sans-serif; /* More readable for a sub-heading */
-            font-size: 2.2rem; /* Slightly smaller than main page title */
-            color: #8B4513; /* colorDarkBrown */
+        .content h2 {
+            font-family: 'Roboto', Arial, sans-serif;
+            font-size: 2.2rem;
+            color: #8B4513;
             margin-bottom: 25px;
             text-align: center;
         }
 
-        .content p, .content ul {
+        .content p.intro {
             font-size: 1.1rem;
-            text-align: left;
-            margin-bottom: 15px;
+            text-align: center;
+            margin-bottom: 25px;
             color: #212121;
         }
 
-        .feature-category {
-            margin-bottom: 30px;
-            text-align: left;
-        }
-        .feature-category h3 { /* For "The GUI Package Generator", etc. */
-            font-family: 'Creepster', cursive;
-            font-size: 1.8rem;
-            color: #A0522D; /* colorMediumBrown */
-            border-bottom: 1px solid #D2B48C;
-            padding-bottom: 5px;
-            margin-top: 25px; /* Space above category title */
-            margin-bottom: 15px;
-        }
-        .feature-category ul {
+        .content ul.features-list {
             list-style-type: none;
             padding-left: 0;
+            margin-top: 20px;
         }
-        .feature-category ul li {
-            padding: 10px 0 10px 5px;
+
+        .content ul.features-list li {
+            padding: 12px 0 12px 5px;
             border-bottom: 1px dotted #D2B48C;
+            font-size: 1.1rem;
         }
-        .feature-category ul li:last-child {
+        .content ul.features-list li:last-child {
             border-bottom: none;
         }
-        .feature-category ul li::before {
+        .content ul.features-list li::before {
             content: "👻 ";
             margin-right: 10px;
             color: #A0522D;
         }
-        .feature-category ul li strong {
-            color: #8B4513; /* colorDarkBrown for emphasis */
-            font-weight: bold; /* Ensure it's bold if Roboto normal is used */
+        .content ul.features-list li strong {
+            color: #8B4513;
+            font-weight: bold;
+        }
+
+        .important-note {
+            margin-top: 30px;
+            padding: 15px;
+            background-color: #F0E68C; /* Khaki - a slightly different beige for notes */
+            border: 1px solid #DACAA4; /* Darker Khaki border */
+            border-radius: 8px;
+            font-size: 1rem;
+            text-align: center;
+            color: #554C20; /* Darker text for note */
+        }
+        .important-note strong {
+            color: #8B4513; /* DarkBrown for emphasis in note */
         }
 
 
@@ -186,9 +191,6 @@
             .content h2 {
                 font-size: 1.8rem;
             }
-            .feature-category h3 {
-                font-size: 1.6rem;
-            }
             .download-button {
                 font-size: 1.5rem;
                 padding: 12px 25px;
@@ -204,11 +206,11 @@
             .content h2 {
                 font-size: 1.6rem;
             }
-            .feature-category h3 {
-                font-size: 1.4rem;
-            }
-             .content ul li::before {
+             .content ul.features-list li::before {
                 content: "🔸 ";
+            }
+            .important-note {
+                font-size: 0.9rem;
             }
         }
 
@@ -223,90 +225,42 @@
         </header>
 
         <section class="content">
-            <h2>Behold! The Uncanny Abilities of GenMon:</h2>
-            <p>
-                GenMon isn't just a tool; it's your personal workshop for crafting specialized Windows activity monitoring solutions.
-                Here’s a deeper look into the crypt of its capabilities:
+            <h2>GenMon's Key Specter-acles:</h2>
+            <p class="intro">
+                Craft your own Windows activity monitoring tools with ease! GenMon empowers you to generate a
+                client-server suite designed for effective and secure observation.
             </p>
 
-            <div class="feature-category">
-                <h3>The GUI Package Generator (Your Creation Cauldron):</h3>
-                <ul>
-                    <li>
-                        <strong>✨ Truly Standalone Generation:</strong>
-                        The real magic! You don't need a Go development environment or any complex setup to use the GenMon GUI.
-                        It cleverly embeds the necessary Go compiler and source code templates. Just provide the Go SDK zip as instructed, and GenMon handles the arcane art of compilation for you.
-                    </li>
-                    <li>
-                        <strong>👻 User-Friendly Fyne GUI:</strong>
-                        A clean, intuitive graphical interface guides you through a simple, multi-step process. No command-line chanting required to conjure your monitoring tools!
-                    </li>
-                    <li>
-                        <strong>🔒 Dynamic & Secure Configuration:</strong>
-                        Before generation, GenMon automatically conjures unique, cryptographically strong AES-256 encryption keys for data payloads and unique Libp2p identity seeds for the server. You can also customize P2P bootstrap peer addresses.
-                    </li>
-                    <li>
-                        <strong>📦 Neatly Packaged Output:</strong>
-                        GenMon bestows upon you two distinct, ready-to-deploy packages: one for the Activity Monitor Client and one for the Local Log Server, complete with a vital `README_IMPORTANT_INSTRUCTIONS.txt` scroll.
-                    </li>
-                </ul>
+            <ul class="features-list">
+                <li>
+                    <strong>Effortless Tool Creation:</strong> Generate a full monitoring suite (client & server) via a user-friendly GUI – no Go installation required on your system!
+                </li>
+                <li>
+                    <strong>Stealthy Windows Client:</strong> The generated client discreetly tracks application usage and keyboard input, with local encrypted SQLite caching and Windows auto-start capability.
+                </li>
+                <li>
+                    <strong>Secure P2P Data Sync:</strong> Client activity logs are AES-256 encrypted and securely synchronized to your server over a robust P2P (Libp2p) connection.
+                </li>
+                <li>
+                    <strong>Centralized Log Server:</strong> Your dedicated server securely receives, decrypts, and stores all client logs in its own SQLite database, featuring configurable data retention.
+                </li>
+                <li>
+                    <strong>Simple Web UI for Insights:</strong> Easily view and browse collected activity logs from all connected clients through the server's straightforward, built-in web interface.
+                </li>
+                <li>
+                    <strong>Pure Go & Portable:</strong> Both the GenMon generator and the client/server tools it creates are built with pure Go, ensuring clean, portable executables without CGo dependencies.
+                </li>
+            </ul>
+
+            <div class="important-note">
+                <p>
+                    <strong>A Friendly Haunt from the Developers:</strong> Please be patient! After the client is first launched,
+                    it may take <strong>up to 20 minutes</strong> for initial data to appear on the server.
+                    This is due to the mystical ways of P2P network discovery, routing establishment, and NAT traversal.
+                    Once connected, transmissions will be more regular!
+                </p>
             </div>
 
-            <div class="feature-category">
-                <h3>The Generated Activity Monitor Client (Your Silent Watcher):</h3>
-                <ul>
-                    <li>
-                        <strong>👁️ Comprehensive Activity Tracking:</strong>
-                        Discreetly observes and records foreground application switches, window titles, and all keyboard input. It intelligently distinguishes between typed characters and special keys (like [ENTER], [CTRL], [F1], etc.).
-                    </li>
-                    <li>
-                        <strong>🛡️ Local Encrypted Cache (SQLite):</strong>
-                        All captured apparitions (activity data) are first stored locally in a secure SQLite database (`activity_cache.sqlite`). This ensures data isn't lost if the server is temporarily in another dimension (unavailable) and allows for configurable local retention.
-                    </li>
-                    <li>
-                        <strong>🤫 Stealthy Operation & Persistence:</strong>
-                        Designed to run unobtrusively in the background on Windows machines without a visible console window. It also includes a Windows Autorun feature, allowing it to rise with the system.
-                    </li>
-                    <li>
-                        <strong>🗝️ AES-256 Encrypted Transmission:</strong>
-                        Log batches are cloaked in strong AES-256-GCM encryption before being spirited away to the server, ensuring data confidentiality during its P2P transit.
-                    </li>
-                    <li>
-                        <strong>🕸️ Secure P2P Synchronization (Libp2p):</strong>
-                        Utilizes the power of Libp2p to establish direct or relayed connections to its designated server. This includes support for NAT traversal (hole punching) when connecting through bootstrap peers.
-                    </li>
-                    <li>
-                        <strong>⚙️ Pre-Configured & Ready:</strong>
-                        All necessary settings – the server's P2P address, the unique encryption key, sync intervals, and more – are baked directly into the client binary during generation. Deploy and run!
-                    </li>
-                </ul>
-            </div>
-
-            <div class="feature-category">
-                <h3>The Generated Local Log Server (Your Central Log-Book):</h3>
-                <ul>
-                    <li>
-                        <strong>📥 Centralized Secure Log Reception:</strong>
-                        Acts as the secure P2P endpoint for your monitoring clients. It listens for incoming connections, receives the encrypted log batches, decrypts them using the shared secret key, and meticulously archives them.
-                    </li>
-                    <li>
-                        <strong>🗄️ Robust SQLite Storage:</strong>
-                        All received and decrypted log events are stored in its own local SQLite database (`activity_server.sqlite`), making data organized and accessible.
-                    </li>
-                    <li>
-                        <strong>📜 Simple Web UI for Log Viewing:</strong>
-                        Includes a built-in, lightweight web server that provides a straightforward interface to view the collected activity logs. Features pagination for easy browsing of extensive records.
-                    </li>
-                    <li>
-                        <strong>🆔 Unique P2P Identity:</strong>
-                        Operates with its own unique Libp2p identity (generated by the GenMon GUI), allowing clients to specifically target and connect to it.
-                    </li>
-                    <li>
-                        <strong>⏳ Configurable Data Retention:</strong>
-                        You can define how long the server should keep the logs, with an automatic pruning mechanism to manage your data footprint over time.
-                    </li>
-                </ul>
-            </div>
         </section>
 
         <section class="download-section">
@@ -314,7 +268,7 @@
         </section>
 
         <footer>
-            <p>© <span id="currentYear"></span> RIZA. All rights reserved (mostly).</p>
+            <p>© <span id="currentYear"></span> RIZAmcg. All rights reserved (mostly).</p>
             <p>GenMon is part of the <a href="https://github.com/RIZAmohammadkhan/GuiKeyStandaloneGo" target="_blank" rel="noopener noreferrer">GuiKeyStandaloneGo</a> project.</p>
         </footer>
     </div>
