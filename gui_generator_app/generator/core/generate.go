@@ -303,13 +303,6 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 	}
 	genSettings.ProgressCallback("Client template compiled.", 60)
 
-	// No need to run tidy again unless server has drastically different top-level deps not covered.
-	// genSettings.ProgressCallback("Ensuring module dependencies (go mod tidy) for server...", 62)
-	// if err := runGoModTidy(genSettings.TempModuleRootPath, genSettings.GoExecutablePath); err != nil {
-	// 	log.Printf("[core] Warning: Second 'go mod tidy' for server compilation failed (might be okay): %v", err)
-	// }
-	// genSettings.ProgressCallback("Server dependencies ensured.", 65)
-
 	genSettings.ProgressCallback(fmt.Sprintf("Compiling server template from %s...", serverSrcPath), 65)
 	if err := compileGoTemplate(serverSrcPath, serverOutPath, false, genSettings.GoExecutablePath); err != nil {
 		return genInfo, fmt.Errorf("failed to compile server template: %w", err)
@@ -448,12 +441,12 @@ func compileGoTemplate(srcDir, outputPath string, clientStealth bool, goExecutab
 	if clientStealth {
 		ldflags = append(ldflags, "-H=windowsgui")
 	}
-	ldflags = append(ldflags, "-s", "-w")
+	ldflags = append(ldflags, "-s", "-w") // Add stripping flags
 
 	if len(ldflags) > 0 {
 		args = append(args, "-ldflags="+strings.Join(ldflags, " "))
 	}
-	args = append(args, ".")
+	args = append(args, ".") // Build the package in the current directory (srcDir)
 
 	cmd := exec.Command(effectiveGoExecutable, args...)
 	cmd.Dir = srcDir

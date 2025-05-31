@@ -51,7 +51,7 @@ type guiApp struct {
 
 	// Shared data
 	extractedGoExePath     string
-	extractedTemplatesPath string
+	extractedTemplatesPath string // This will hold the temporary module root path
 	cleanupGoSdkFunc       func() error
 	cleanupTemplatesFunc   func() error
 	selectedOutputDir      string
@@ -228,8 +228,6 @@ func (ui *guiApp) setupUI() {
 	ui.mainWin.SetContent(container.NewPadded(scrollContainer))
 }
 
-// In your main.go, update the prepareEnvironment function:
-
 func (ui *guiApp) prepareEnvironment() {
 	log.Println("[prep] Starting environment preparation")
 	ui.operationCtx, ui.operationCancel = context.WithCancel(context.Background())
@@ -255,12 +253,12 @@ func (ui *guiApp) prepareEnvironment() {
 	ui.extractedGoExePath = goExe
 	ui.cleanupGoSdkFunc = cleanupGo
 
-	// Step 2: Prepare Templates - CHANGE THIS LINE
 	fyne.Do(func() {
 		ui.updatePrepStatus("Preparing source templates...", 50)
 	})
 
 	// Step 2: Prepare Templates using GetTemporaryModulePath
+	// templatesPath is the root of the temporary module
 	templatesPath, cleanupTpl, errTpl := GetTemporaryModulePath(ui.operationCtx, func(msg string, pct int) {
 		displayPct := 50 + int(float64(pct)*0.5) // Scale to 50-100%
 		fyne.Do(func() { ui.updatePrepStatus(msg, displayPct) })
@@ -274,7 +272,7 @@ func (ui *guiApp) prepareEnvironment() {
 		}
 		return
 	}
-	ui.extractedTemplatesPath = templatesPath
+	ui.extractedTemplatesPath = templatesPath // This IS the temporary module root path
 	ui.cleanupTemplatesFunc = cleanupTpl
 
 	// Environment ready - enable configuration section
@@ -364,14 +362,16 @@ func (ui *guiApp) performGeneration() {
 	bootstrapFinal := strings.Join(bootstrapCleaned, ",")
 
 	go func() {
-		// Build the correct templates path from the module root
+		// ui.extractedTemplatesPath IS the temporary module root.
+		// TemplatesBasePath for core.PerformGeneration should be <temp_module_root>/generator/templates
 		templatesBasePath := filepath.Join(ui.extractedTemplatesPath, "generator", "templates")
 
 		settings := core.GeneratorSettings{
 			OutputDirPath:      ui.selectedOutputDir,
 			BootstrapAddresses: bootstrapFinal,
 			GoExecutablePath:   ui.extractedGoExePath,
-			TemplatesBasePath:  templatesBasePath, // Updated to point to the actual templates directory
+			TempModuleRootPath: ui.extractedTemplatesPath, // Pass the actual temporary module root
+			TemplatesBasePath:  templatesBasePath,
 			ProgressCallback: func(message string, percentage int) {
 				fyne.Do(func() {
 					ui.updateGenStatus(message, percentage)
