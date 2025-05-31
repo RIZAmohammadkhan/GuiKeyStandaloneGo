@@ -57,7 +57,6 @@ Instructions:
    - Server Bootstrap Addresses: {{range .ServerConfig.BootstrapAddresses}}{{.}} {{end}}
    - Server Log File: {{.ServerConfig.InternalLogFileDir}}/{{.ServerConfig.InternalLogFileName}} (Level: {{.ServerConfig.InternalLogLevel}})
 
-
 2. Activity Monitor Client (For Distribution to Target Machines):
    - The 'ActivityMonitorClient_Package' directory contains the client application.
    - Distribute the *contents* of this directory to the machine(s) you want to monitor.
@@ -65,7 +64,6 @@ Instructions:
    - It is configured to connect to Server Peer ID: {{.Generated.ServerPeerID}}
    - It will use these bootstrap multiaddresses: {{range .ClientConfig.BootstrapAddresses}}{{.}} {{end}}
    - Client Log File: {{.ClientConfig.InternalLogFileDir}}/{{.ClientConfig.InternalLogFileName}} (Level: {{.ClientConfig.InternalLogLevel}})
-
 
 Security Considerations:
 - The app-level encryption key is vital for data confidentiality. Keep it secure.
@@ -166,12 +164,6 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 
 	// --- Prepare Client Configuration Values ---
 	clientCfgValues := config.DefaultClientSettings()
-	// Apply overrides from genSettings.ClientConfigOverrides to clientCfgValues
-	// This is where UI/CLI flags for specific client settings would be applied.
-	// Example:
-	// if genSettings.ClientConfigOverrides.SyncIntervalSecs > 0 {
-	//     clientCfgValues.SyncIntervalSecs = genSettings.ClientConfigOverrides.SyncIntervalSecs
-	// } // ... and so on for other overridable fields.
 	clientCfgValues.ClientID = genInfo.AppClientID
 	clientCfgValues.EncryptionKeyHex = genInfo.AppEncryptionKeyHex
 	clientCfgValues.ServerPeerID = genInfo.ServerPeerID
@@ -187,31 +179,15 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 	}
 
 	// --- Prepare Server Configuration Values ---
-	serverCfgValues := config.DefaultServerSettings() // This now includes defaults for log paths and bootstrap
-	// Apply overrides from genSettings.ServerConfigOverrides to serverCfgValues
-	// Example:
-	// if genSettings.ServerConfigOverrides.LogRetentionDays != 0 {
-	//     serverCfgValues.LogRetentionDays = genSettings.ServerConfigOverrides.LogRetentionDays
-	// }
-	// if genSettings.ServerConfigOverrides.InternalLogLevel != "" {
-	//     serverCfgValues.InternalLogLevel = genSettings.ServerConfigOverrides.InternalLogLevel
-	// } // ... and so on for other overridable fields.
+	serverCfgValues := config.DefaultServerSettings()
 	serverCfgValues.EncryptionKeyHex = genInfo.AppEncryptionKeyHex
 	serverCfgValues.ServerIdentityKeySeedHex = genInfo.ServerIdentitySeedHex
-	// Server uses the same bootstrap list as the client for simplicity in this setup
 	if len(clientCfgValues.BootstrapAddresses) > 0 {
 		serverCfgValues.BootstrapAddresses = make([]string, len(clientCfgValues.BootstrapAddresses))
 		copy(serverCfgValues.BootstrapAddresses, clientCfgValues.BootstrapAddresses)
 	} else {
-		// If client also has no bootstrap (e.g., user cleared it via -bootstrap=""),
-		// then server also gets an empty list from this logic.
-		// DefaultServerSettings already initializes BootstrapAddresses to an empty slice,
-		// so this ensures it's explicitly an empty slice if client's is also empty.
 		serverCfgValues.BootstrapAddresses = []string{}
 	}
-	// The fields InternalLogLevel, InternalLogFileDir, InternalLogFileName for serverCfgValues
-	// will take their values from config.DefaultServerSettings() unless explicitly overridden
-	// by genSettings.ServerConfigOverrides. Since we added them to DefaultServerSettings, they are populated.
 
 	_, currentFilePath, _, ok := runtime.Caller(0)
 	if !ok {
@@ -237,7 +213,6 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 		return genInfo, fmt.Errorf("failed to create server package dir: %w", err)
 	}
 
-	// 3. Generate config_generated.go files
 	clientTemplateData := struct {
 		config.ClientSettings
 		MaxLogFileSizeMBIsSet bool
@@ -253,13 +228,11 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 		return genInfo, fmt.Errorf("failed to write client_generated_config.go: %w", err)
 	}
 
-	// Pass serverCfgValues directly as its template now expects all necessary fields
 	serverGeneratedGoPath := filepath.Join(serverSrcPath, "config_generated.go")
 	if err := writeGoConfig(serverGeneratedGoPath, serverGeneratedConfigTemplate, serverCfgValues); err != nil {
 		return genInfo, fmt.Errorf("failed to write server_generated_config.go: %w", err)
 	}
 
-	// 4. Compile Client and Server Templates
 	clientOutPath := filepath.Join(clientPackagePath, clientExeName)
 	serverOutPath := filepath.Join(serverPackagePath, serverExeName)
 
@@ -275,7 +248,6 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 	defer os.Remove(clientGeneratedGoPath)
 	defer os.Remove(serverGeneratedGoPath)
 
-	// 5. Copy Server UI Assets
 	serverPackageStaticDir := filepath.Join(serverPackagePath, "static")
 	serverPackageTemplatesDir := filepath.Join(serverPackagePath, "web_templates")
 
@@ -293,7 +265,6 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 		log.Printf("Copied server HTML templates to %s", serverPackageTemplatesDir)
 	}
 
-	// 6. Create README
 	readmeData := struct {
 		Timestamp          string
 		Generated          GeneratedInfo
@@ -329,8 +300,6 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 	return genInfo, nil
 }
 
-// writeGoConfig, compileGoTemplate, buildEnvValueFor, copyDir functions remain the same as previous full generate.go
-
 func writeGoConfig(path string, goTemplateContent string, cfgData interface{}) error {
 	tmpl, err := template.New("goconfig").Parse(goTemplateContent)
 	if err != nil {
@@ -352,33 +321,41 @@ func writeGoConfig(path string, goTemplateContent string, cfgData interface{}) e
 }
 
 func compileGoTemplate(srcDir, outputPath string, clientStealth bool) error {
-	cmd := exec.Command("go", "build", "-o", outputPath)
-	cmd.Dir = srcDir
-	buildEnv := append(os.Environ(), "GOOS=windows", "GOARCH=amd64", "CGO_ENABLED=1")
-	targetGOOS := buildEnvValueFor("GOOS", buildEnv)
-	generatorGOOS := runtime.GOOS
-	if targetGOOS == "windows" && generatorGOOS != "windows" {
-		buildEnv = append(buildEnv, "CC=x86_64-w64-mingw32-gcc")
-	}
-	cmd.Env = buildEnv
+	// Explicitly specify "." to build the package in the current directory (cmd.Dir).
+	// Add "-v" for verbose output from the build command.
+	args := []string{"build", "-v", "-o", outputPath}
+
+	buildEnv := append(os.Environ(), "GOOS=windows", "GOARCH=amd64", "CGO_ENABLED=0")
+
 	var ldflags []string
 	if clientStealth {
 		ldflags = append(ldflags, "-H=windowsgui")
 	}
 	if len(ldflags) > 0 {
-		cmd.Args = append(cmd.Args, "-ldflags="+strings.Join(ldflags, " "))
+		args = append(args, "-ldflags="+strings.Join(ldflags, " "))
 	}
+
+	// Add the package specifier "." to the end of args
+	args = append(args, ".")
+
+	cmd := exec.Command("go", args...)
+	cmd.Dir = srcDir
+	cmd.Env = buildEnv
+
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	log.Printf("Running build command: %s %s (Target Env: GOOS=%s GOARCH=%s CGO_ENABLED=%s CC=%s)",
-		cmd.Path, strings.Join(cmd.Args[1:], " "),
+
+	log.Printf("Running build command: go %s (Target Env: GOOS=%s GOARCH=%s CGO_ENABLED=%s) in %s",
+		strings.Join(args, " "), // cmd.Args[0] is "go", so join args directly for logging
 		buildEnvValueFor("GOOS", cmd.Env), buildEnvValueFor("GOARCH", cmd.Env),
-		buildEnvValueFor("CGO_ENABLED", cmd.Env), buildEnvValueFor("CC", cmd.Env))
+		buildEnvValueFor("CGO_ENABLED", cmd.Env),
+		cmd.Dir)
+
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to compile %s: %w\nBuild command: %s %s\nEnv: %v\nStdout: %s\nStderr: %s",
-			srcDir, err, cmd.Path, strings.Join(cmd.Args[1:], " "), cmd.Env, stdout.String(), stderr.String())
+		return fmt.Errorf("failed to compile %s: %w\nBuild command: go %s\nEnv: %v\nDir: %s\nStdout: %s\nStderr: %s",
+			srcDir, err, strings.Join(args, " "), cmd.Env, cmd.Dir, stdout.String(), stderr.String())
 	}
 	return nil
 }

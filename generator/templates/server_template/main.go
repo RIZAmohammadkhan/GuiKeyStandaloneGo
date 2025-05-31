@@ -13,13 +13,12 @@ import (
 	"syscall"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3" // SQLite driver for side effects
+	_ "modernc.org/sqlite" // Pure Go SQLite driver
 )
 
 var serverGlobalLogger *log.Logger
 
 func setupServerLogger() {
-	// Use embedded configuration constants
 	logFileName := CfgInternalLogFileName
 	logDir := CfgInternalLogFileDir
 
@@ -35,10 +34,9 @@ func setupServerLogger() {
 	}
 
 	if err := os.MkdirAll(absLogDir, 0755); err != nil {
-		// Attempt to log to a fallback file in current directory if specified dir fails
 		fallbackFile, ferr := os.OpenFile("server_critical_setup.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if ferr == nil {
-			log.SetOutput(fallbackFile) // Switch standard log's output
+			log.SetOutput(fallbackFile)
 			defer fallbackFile.Close()
 		}
 		log.Fatalf("SERVER CRITICAL: Failed to create server log directory %s: %v", absLogDir, err)
@@ -53,10 +51,8 @@ func setupServerLogger() {
 	serverGlobalLogger.Printf("Server logger initialized (Level: %s). Log file: %s", CfgInternalLogLevel, logPath)
 }
 
-
 func main() {
-	// config_generated.go (in this package) defines Cfg... constants
-	setupServerLogger() // Initializes serverGlobalLogger
+	setupServerLogger()
 
 	serverGlobalLogger.Printf("Local Log Server starting. Version: DEV. (Embedded Config Active)")
 	serverGlobalLogger.Printf("P2P Listen Address: %s", CfgP2PListenAddress)
@@ -65,7 +61,6 @@ func main() {
 	serverGlobalLogger.Printf("Log Retention Days: %d", CfgLogRetentionDays)
 	serverGlobalLogger.Printf("Server Bootstrap Addresses: %v", CfgBootstrapAddresses)
 
-	// Initialize ServerLogStore
 	dbPathServer := CfgDatabasePath
 	if !filepath.IsAbs(dbPathServer) {
 		exePath, err := os.Executable()
@@ -84,12 +79,11 @@ func main() {
 		}
 	}()
 
-	// Initialize ServerP2PManager
 	serverP2PMan, err := NewServerP2PManager(
 		serverGlobalLogger,
 		CfgP2PListenAddress,
 		CfgServerIdentityKeySeedHex,
-		CfgBootstrapAddresses, // Use generated bootstrap addresses
+		CfgBootstrapAddresses,
 		serverLogStore,
 		CfgEncryptionKeyHex,
 	)
@@ -98,36 +92,28 @@ func main() {
 	}
 	defer serverP2PMan.Close()
 
-	// Load HTML templates for Web UI
-	exePath, _ := os.Executable() // Assuming success as it's used before
-	// Templates are expected to be in a 'web_templates' subdirectory relative to the executable
-	// This path is where the generator copies them.
+	exePath, _ := os.Executable()
 	templateDir := filepath.Join(filepath.Dir(exePath), "web_templates")
 	if err := LoadTemplates(templateDir, serverGlobalLogger); err != nil {
 		serverGlobalLogger.Fatalf("SERVER CRITICAL: Failed to load HTML templates from %s: %v", templateDir, err)
 	}
 
-	// --- Channels & WaitGroup for graceful shutdown ---
 	osQuitChan := make(chan os.Signal, 1)
 	signal.Notify(osQuitChan, syscall.SIGINT, syscall.SIGTERM)
 	internalQuitChan := make(chan struct{})
 	var wg sync.WaitGroup
 
-	// --- Start Server Goroutines ---
-	// P2P Manager
 	wg.Add(1)
 	go runServerP2PManager(serverP2PMan, internalQuitChan, &wg, serverGlobalLogger)
 
-	// LogStore Manager (for pruning etc.)
 	wg.Add(1)
 	pruneInterval := time.Duration(CfgLogDeletionCheckIntervalHrs) * time.Hour
-	if CfgLogDeletionCheckIntervalHrs == 0 { 
-		pruneInterval = 24 * 365 * time.Hour // Effectively disable
+	if CfgLogDeletionCheckIntervalHrs == 0 {
+		pruneInterval = 24 * 365 * time.Hour
 		serverGlobalLogger.Println("Server LogStore pruning disabled (interval is 0).")
 	}
 	go runServerLogStoreManager(serverLogStore, internalQuitChan, &wg, CfgLogRetentionDays, pruneInterval)
 
-	// Web UI HTTP Server
 	webUIEnv := &WebUIEnv{
 		LogStore:     serverLogStore,
 		ServerPeerID: serverP2PMan.host.ID().String(),
@@ -137,20 +123,19 @@ func main() {
 	mux.HandleFunc("/", indexHandler)
 	mux.HandleFunc("/logs", webUIEnv.viewLogsHandler)
 
-	// Static files are expected to be in a 'static' subdirectory relative to the executable
 	staticFileDir := filepath.Join(filepath.Dir(exePath), "static")
 	fileServer := http.FileServer(http.Dir(staticFileDir))
 	mux.Handle("/static/", http.StripPrefix("/static/", fileServer))
-	
+
 	httpServer := &http.Server{
-		Addr:    CfgWebUIListenAddress,
-		Handler: mux,
+		Addr:         CfgWebUIListenAddress,
+		Handler:      mux,
 		ReadTimeout:  10 * time.Second,
-        WriteTimeout: 10 * time.Second,
-        IdleTimeout:  120 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  120 * time.Second,
 	}
 
-	wg.Add(1) // For the HTTP server listener goroutine
+	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		serverGlobalLogger.Printf("Web UI server starting to listen on http://%s", CfgWebUIListenAddress)
@@ -159,10 +144,9 @@ func main() {
 		}
 		serverGlobalLogger.Println("Web UI server listener stopped.")
 	}()
-	
-	// Goroutine to handle graceful shutdown of HTTP server
+
 	go func() {
-		<-internalQuitChan 
+		<-internalQuitChan
 		serverGlobalLogger.Println("Web UI server: Shutdown signal received, attempting graceful shutdown...")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -171,7 +155,6 @@ func main() {
 		}
 		serverGlobalLogger.Println("Web UI server shut down.")
 	}()
-
 
 	serverGlobalLogger.Println("Server main components initialized. Waiting for shutdown signal...")
 	<-osQuitChan

@@ -12,17 +12,12 @@ import (
 	"time" // For PruneOldLogs
 
 	"guikeystandalonego/pkg/types" // Shared LogEvent type
-
-	_ "github.com/mattn/go-sqlite3" // SQLite driver
+	// Pure Go SQLite driver will be added by `go mod tidy`
 	// For event IDs if needed for querying specific events
 )
 
-// Constants for DB Pragmas (can be shared with client if moved to pkg)
-const (
-	serverDBPragmaWAL         = "PRAGMA journal_mode=WAL;"
-	serverDBPragmaBusyTimeout = "PRAGMA busy_timeout = 5000;"
-	serverDBPragmaSynchronous = "PRAGMA synchronous = NORMAL;"
-)
+// Driver name for modernc.org/sqlite
+const serverDBDriverName = "sqlite"
 
 type ServerLogStore struct {
 	db     *sql.DB
@@ -40,19 +35,17 @@ func NewServerLogStore(dbFilePath string, logger *log.Logger) (*ServerLogStore, 
 		return nil, fmt.Errorf("server_logstore: failed to create database directory %s: %w", dbDir, err)
 	}
 
-	dsn := fmt.Sprintf("file:%s?cache=shared&mode=rwc", dbFilePath)
+	// DSN for modernc.org/sqlite, includes PRAGMAs
+	dsn := fmt.Sprintf("file:%s?cache=shared&mode=rwc&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)", dbFilePath)
 
-	db, err := sql.Open("sqlite3", dsn)
+	// *** THIS IS THE LINE TO FIX ***
+	// db, err := sql.Open("sqlite3", dsn) // OLD, WRONG DRIVER
+	db, err := sql.Open(serverDBDriverName, dsn) // CORRECTED: Use the constant for modernc.org/sqlite
 	if err != nil {
 		return nil, fmt.Errorf("server_logstore: failed to open SQLite database at %s: %w", dbFilePath, err)
 	}
 
-	pragmas := []string{serverDBPragmaWAL, serverDBPragmaBusyTimeout, serverDBPragmaSynchronous}
-	for _, pragma := range pragmas {
-		if _, errP := db.Exec(pragma); errP != nil {
-			logger.Printf("ServerLogStore: Warning - Failed to set pragma '%s': %v", pragma, errP)
-		}
-	}
+	// Pragmas are now part of the DSN, no need for separate Exec calls for them.
 
 	store := &ServerLogStore{
 		db:     db,
@@ -70,19 +63,16 @@ func NewServerLogStore(dbFilePath string, logger *log.Logger) (*ServerLogStore, 
 }
 
 func (s *ServerLogStore) initSchema() error {
-	// Schema is similar to client's, but server might have more complex querying needs later.
-	// For now, storing the full LogEvent JSON is fine.
-	// Added received_at timestamp for server-side tracking.
 	createTableSQL := `
 	CREATE TABLE IF NOT EXISTS received_logs (
-		event_id TEXT PRIMARY KEY,         -- LogEvent.ID (UUID string) from the client
-		client_id TEXT NOT NULL,           -- LogEvent.ClientID (UUID string) from the client
-		received_at INTEGER NOT NULL,      -- Timestamp (Unix seconds) when server received/processed this
-		event_timestamp INTEGER NOT NULL,  -- Original LogEvent.Timestamp (Unix seconds)
+		event_id TEXT PRIMARY KEY,        
+		client_id TEXT NOT NULL,          
+		received_at INTEGER NOT NULL,     
+		event_timestamp INTEGER NOT NULL, 
 		application_name TEXT,
 		initial_window_title TEXT,
 		schema_version INTEGER,      
-		full_log_event_json TEXT NOT NULL -- Full LogEvent marshaled to JSON
+		full_log_event_json TEXT NOT NULL 
 	);
 	CREATE INDEX IF NOT EXISTS idx_received_logs_client_id ON received_logs (client_id);
 	CREATE INDEX IF NOT EXISTS idx_received_logs_event_timestamp ON received_logs (event_timestamp);
@@ -97,7 +87,6 @@ func (s *ServerLogStore) initSchema() error {
 	return nil
 }
 
-// AddReceivedLogEvents stores a batch of LogEvents received from a client.
 func (s *ServerLogStore) AddReceivedLogEvents(events []types.LogEvent, receivedTime time.Time) (int, error) {
 	if len(events) == 0 {
 		return 0, nil
@@ -113,7 +102,7 @@ func (s *ServerLogStore) AddReceivedLogEvents(events []types.LogEvent, receivedT
 			event_id, client_id, received_at, event_timestamp, 
 			application_name, initial_window_title, schema_version, full_log_event_json
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(event_id) DO NOTHING`) // Gracefully handle duplicate event IDs from client
+		ON CONFLICT(event_id) DO NOTHING`)
 	if err != nil {
 		tx.Rollback()
 		return 0, fmt.Errorf("server_logstore: failed to prepare insert statement: %w", err)
@@ -125,7 +114,7 @@ func (s *ServerLogStore) AddReceivedLogEvents(events []types.LogEvent, receivedT
 		jsonData, jsonErr := json.Marshal(event)
 		if jsonErr != nil {
 			s.logger.Printf("ServerLogStore: Error marshaling event ID %s to JSON, skipping: %v", event.ID, jsonErr)
-			continue // Skip this event
+			continue
 		}
 
 		res, execErr := stmt.Exec(
@@ -139,9 +128,7 @@ func (s *ServerLogStore) AddReceivedLogEvents(events []types.LogEvent, receivedT
 			string(jsonData),
 		)
 		if execErr != nil {
-			// Log individual error, but continue, then rollback if any failed.
 			s.logger.Printf("ServerLogStore: Error inserting event ID %s: %v", event.ID, execErr)
-			// For now, let's rollback on any error in the batch
 			tx.Rollback()
 			return insertedCount, fmt.Errorf("server_logstore: error inserting event ID %s (rolled back): %w", event.ID, execErr)
 		}
@@ -159,11 +146,9 @@ func (s *ServerLogStore) AddReceivedLogEvents(events []types.LogEvent, receivedT
 	return insertedCount, nil
 }
 
-// GetLogEventsPaginated retrieves logs for the web UI.
 func (s *ServerLogStore) GetLogEventsPaginated(page uint, pageSize uint) ([]types.LogEvent, int64, error) {
 	offset := (page - 1) * pageSize
 
-	// Get total count first for pagination info
 	var totalCount int64
 	err := s.db.QueryRow("SELECT COUNT(*) FROM received_logs").Scan(&totalCount)
 	if err != nil {
@@ -204,7 +189,6 @@ func (s *ServerLogStore) GetLogEventsPaginated(page uint, pageSize uint) ([]type
 	return events, totalCount, nil
 }
 
-// PruneOldLogs for the server
 func (s *ServerLogStore) PruneOldLogs(retentionDays uint32) (int64, error) {
 	if retentionDays == 0 {
 		s.logger.Println("ServerLogStore: Log retention is indefinite (0 days), skipping pruning.")
@@ -212,7 +196,6 @@ func (s *ServerLogStore) PruneOldLogs(retentionDays uint32) (int64, error) {
 	}
 
 	cutoffTime := time.Now().Add(-time.Duration(retentionDays) * 24 * time.Hour)
-	// Prune based on original client event_timestamp for consistency, or received_at for server policy
 	cutoffTimestampUnix := cutoffTime.Unix()
 
 	s.logger.Printf("ServerLogStore: Pruning logs older than %d days (event_timestamp before %s / %d).",
@@ -222,7 +205,7 @@ func (s *ServerLogStore) PruneOldLogs(retentionDays uint32) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("server_logstore: failed to execute prune old logs query: %w", err)
 	}
-	rowsAffected, _ := result.RowsAffected() // Error check on RowsAffected is less critical
+	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected > 0 {
 		s.logger.Printf("ServerLogStore: Pruned %d old log entries.", rowsAffected)
 	} else {
@@ -239,7 +222,6 @@ func (s *ServerLogStore) Close() error {
 	return nil
 }
 
-// runServerLogStoreManager (optional, if server store needs background tasks like pruning)
 func runServerLogStoreManager(
 	logStore *ServerLogStore,
 	internalQuit <-chan struct{},
@@ -252,7 +234,7 @@ func runServerLogStoreManager(
 
 	if retentionDays == 0 || pruneInterval == 0 {
 		logStore.logger.Println("Server LogStore Manager: Pruning disabled (retention or interval is 0).")
-		<-internalQuit // Block until quit
+		<-internalQuit
 		logStore.logger.Println("Server LogStore Manager goroutine stopping (pruning was disabled).")
 		return
 	}

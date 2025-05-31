@@ -6,7 +6,7 @@ GuiKeyStandaloneGo is a project aimed at creating a standalone tool to generate 
 2.  **Activity Monitor Client:** A stealthy Windows client that monitors user activity (foreground application, keyboard input) and sends encrypted data via Libp2p.
 3.  **Local Log Server:** A server application that receives encrypted data from clients via Libp2p, stores it, and provides a Web UI for viewing logs.
 
-## Current Project Status (As of [Your Current Date])
+## Current Project Status (As of [Your Current Date of this change])
 
 The project has achieved a significant milestone: an end-to-end P2P data pipeline.
 
@@ -16,14 +16,14 @@ The project has achieved a significant milestone: an end-to-end P2P data pipelin
     *   Embeds all necessary configuration directly into the client and server binaries by generating `config_generated.go` files during its build process for the templates.
     *   Cross-compiles client and server Go templates into Windows executables.
     *   Packages executables with a `README_IMPORTANT_INSTRUCTIONS.txt`.
-    *   Successfully handles CGo dependencies for SQLite in the client template.
+    *   Uses a pure Go SQLite driver, removing CGo dependencies for client and server templates.
 
 *   **Client (Windows Executable):**
     *   Starts with embedded configuration.
     *   Monitors foreground application changes and keyboard input (raw key data).
     *   Processes raw key data into human-readable strings.
     *   Aggregates activity into structured `LogEvent` sessions.
-    *   Caches these `LogEvent`s locally in an SQLite database (`activity_cache.sqlite`) with retention policies and max size enforcement.
+    *   Caches these `LogEvent`s locally in an SQLite database (`activity_cache.sqlite`) with retention policies and max size enforcement (using a pure Go SQLite driver).
     *   Sets up Windows Registry entry for autostart.
     *   Initializes a Libp2p host with Kademlia DHT, AutoNAT, Relay client, and Hole Punching capabilities.
     *   Actively bootstraps into the DHT and attempts to discover the server.
@@ -36,7 +36,7 @@ The project has achieved a significant milestone: an end-to-end P2P data pipelin
     *   Handles incoming P2P streams for the custom log protocol:
         *   Decrypts the received payload.
         *   Unmarshals `LogEvent`s.
-        *   Stores events in its own SQLite database (`activity_server.sqlite`).
+        *   Stores events in its own SQLite database (`activity_server.sqlite`) (using a pure Go SQLite driver).
         *   Sends an acknowledgment response to the client.
     *   Manages its local SQLite log store (pruning old logs).
     *   **A functional (basic) Web UI is implemented** to display logs from its database with pagination, served via an embedded HTTP server.
@@ -93,9 +93,7 @@ GuiKeyStandaloneGo/
 ### Prerequisites
 
 *   Go (version 1.18+ recommended for generics, though current code might work with slightly older).
-*   **For Windows targets (Client & Server):** A C compiler accessible to Go (CGo). MinGW-w64 is recommended if building *on* or *for* Windows.
-    *   If building *on* Windows: Install MinGW-w64 (e.g., via MSYS2) and add its `bin` directory to your system PATH.
-    *   If cross-compiling *from* Linux/macOS *to* Windows: Install the appropriate MinGW-w64 cross-compiler (e.g., `mingw-w64-x86-64-gcc`).
+*   (CGo is no longer required as of [Your Current Date of this change])
 
 ### Running the Generator
 

@@ -15,17 +15,13 @@ import (
 	"guikeystandalonego/pkg/types"
 
 	"github.com/google/uuid"
-	_ "github.com/mattn/go-sqlite3"
+	// Pure Go SQLite driver will be added by `go mod tidy`
 )
 
 const (
-	dbDriverName        = "sqlite3"
-	dbPragmaWAL         = "PRAGMA journal_mode=WAL;"
-	dbPragmaBusyTimeout = "PRAGMA busy_timeout = 5000;"
-	dbPragmaSynchronous = "PRAGMA synchronous = NORMAL;"
-	// Constants for aggressive pruning
-	aggressivePruneBatchSize = 100 // How many oldest events to delete at a time during aggressive prune
-	dbSizeReductionTarget    = 0.8 // Target to reduce DB size to (e.g., 80% of max) during aggressive prune
+	dbDriverName             = "sqlite" // For modernc.org/sqlite
+	aggressivePruneBatchSize = 100      // How many oldest events to delete at a time during aggressive prune
+	dbSizeReductionTarget    = 0.8      // Target to reduce DB size to (e.g., 80% of max) during aggressive prune
 )
 
 type LogStore struct {
@@ -33,9 +29,6 @@ type LogStore struct {
 	logger *log.Logger
 	dbPath string
 }
-
-// NewLogStore, initSchema, AddLogEvent, GetBatchForSync, ConfirmEventsSynced, PruneOldLogs (regular retention)
-// remain the same as the last fully correct version. I'll include them for completeness.
 
 func NewLogStore(dbFilePath string, logger *log.Logger) (*LogStore, error) {
 	if logger == nil {
@@ -46,17 +39,14 @@ func NewLogStore(dbFilePath string, logger *log.Logger) (*LogStore, error) {
 	if err := os.MkdirAll(dbDir, 0755); err != nil {
 		return nil, fmt.Errorf("logstore: failed to create database directory %s: %w", dbDir, err)
 	}
-	dsn := fmt.Sprintf("file:%s?cache=shared&mode=rwc&_journal_mode=WAL&_busy_timeout=5000", dbFilePath)
+	// DSN for modernc.org/sqlite, includes PRAGMAs
+	dsn := fmt.Sprintf("file:%s?cache=shared&mode=rwc&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)", dbFilePath)
 	db, err := sql.Open(dbDriverName, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("logstore: failed to open SQLite database at %s: %w", dbFilePath, err)
 	}
-	pragmas := []string{dbPragmaSynchronous} // WAL and busy_timeout are in DSN now
-	for _, pragma := range pragmas {
-		if _, errP := db.Exec(pragma); errP != nil {
-			logger.Printf("LogStore: Warning - Failed to set pragma '%s': %v", pragma, errP)
-		}
-	}
+	// Pragmas are now part of the DSN, no need for separate Exec calls for them.
+
 	store := &LogStore{db: db, logger: logger, dbPath: dbFilePath}
 	if err := store.initSchema(); err != nil {
 		db.Close()
@@ -127,7 +117,6 @@ func (s *LogStore) GetBatchForSync(limit int) ([]types.LogEvent, error) {
 	if errR := rows.Err(); errR != nil {
 		return nil, fmt.Errorf("logstore: error iterating sync batch rows: %w", errR)
 	}
-	// if len(events) > 0 { s.logger.Printf("LogStore: Retrieved %d events for sync batch.", len(events)) } // Can be noisy
 	return events, nil
 }
 
@@ -151,7 +140,7 @@ func (s *LogStore) ConfirmEventsSynced(eventIDs []uuid.UUID) error {
 		if execErr != nil {
 			s.logger.Printf("LogStore: Error deleting event ID %s during sync: %v", id, execErr)
 			failedDeletes++
-			break /* Stop on first error for atomicity */
+			break 
 		}
 		affected, _ := res.RowsAffected()
 		if affected > 0 {
@@ -169,7 +158,6 @@ func (s *LogStore) ConfirmEventsSynced(eventIDs []uuid.UUID) error {
 	return nil
 }
 
-// PruneOldLogs (Regular Retention-Based Pruning)
 func (s *LogStore) PruneOldLogs(retentionDays uint32) (int64, error) {
 	if retentionDays == 0 {
 		s.logger.Println("LogStore: Regular log pruning disabled (retention_days = 0).")
@@ -190,18 +178,12 @@ func (s *LogStore) PruneOldLogs(retentionDays uint32) (int64, error) {
 	return rowsAffected, nil
 }
 
-// --- NEW: Aggressive Pruning for Max DB Size ---
-// PruneOldestEventsAggressively deletes the oldest N events to reduce DB size.
 func (s *LogStore) PruneOldestEventsAggressively(count int) (int64, error) {
 	if count <= 0 {
 		return 0, nil
 	}
 	s.logger.Printf("LogStore: AGGRESSIVE PRUNING - Attempting to delete %d oldest events...", count)
 
-	// This query finds the event_timestamp of the Nth oldest event, then deletes all events up to and including that one.
-	// This is safer than deleting TOP N without knowing their exact timestamps if there are many with the same timestamp.
-	// However, a simpler "DELETE FROM log_events ORDER BY event_timestamp ASC LIMIT ?" is also common.
-	// For SQLite, direct LIMIT in DELETE is supported.
 	result, err := s.db.Exec("DELETE FROM log_events WHERE id IN (SELECT id FROM log_events ORDER BY event_timestamp ASC LIMIT ?)", count)
 	if err != nil {
 		return 0, fmt.Errorf("logstore: aggressive prune failed: %w", err)
@@ -212,16 +194,12 @@ func (s *LogStore) PruneOldestEventsAggressively(count int) (int64, error) {
 	} else {
 		s.logger.Println("LogStore: AGGRESSIVE PRUNING - No events found to delete, or query failed to match any.")
 	}
-	// After pruning, it's good practice to VACUUM to reclaim disk space, but VACUUM can be slow and locking.
-	// SQLite's auto_vacuum mode (if enabled when DB created) helps, or periodic manual VACUUM.
-	// For now, we won't auto-vacuum here to avoid blocking.
 	return rowsAffected, nil
 }
 
-// CheckAndEnforceDBSize checks DB size and triggers aggressive pruning if limit exceeded.
 func (s *LogStore) CheckAndEnforceDBSize(maxAllowedMB *uint64) {
 	if maxAllowedMB == nil || *maxAllowedMB == 0 {
-		return // No limit set
+		return 
 	}
 	limitBytes := *maxAllowedMB * 1024 * 1024
 
@@ -235,7 +213,6 @@ func (s *LogStore) CheckAndEnforceDBSize(maxAllowedMB *uint64) {
 	if uint64(currentSizeBytes) >= limitBytes {
 		s.logger.Printf("LogStore: WARNING - DB size (%d Bytes) meets or exceeds limit (%d Bytes). Initiating aggressive pruning.", currentSizeBytes, limitBytes)
 
-		// Calculate target size and how much to reduce
 		targetSizeBytes := uint64(float64(limitBytes) * dbSizeReductionTarget)
 		bytesToReduce := currentSizeBytes - int64(targetSizeBytes)
 
@@ -244,8 +221,6 @@ func (s *LogStore) CheckAndEnforceDBSize(maxAllowedMB *uint64) {
 			return
 		}
 
-		// Estimate average event size (very rough) or prune in batches
-		// Let's prune in batches until size is met or no more events
 		var totalPruned int64
 		for uint64(fi.Size()) > targetSizeBytes {
 			prunedThisBatch, errPrune := s.PruneOldestEventsAggressively(aggressivePruneBatchSize)
@@ -253,27 +228,20 @@ func (s *LogStore) CheckAndEnforceDBSize(maxAllowedMB *uint64) {
 				s.logger.Printf("LogStore: Error during aggressive pruning batch: %v. Stopping.", errPrune)
 				break
 			}
-			if prunedThisBatch == 0 { // No more events to prune
+			if prunedThisBatch == 0 { 
 				s.logger.Println("LogStore: Aggressive pruning - no more events to delete, but size still over target. DB might contain free pages.")
 				break
 			}
 			totalPruned += prunedThisBatch
 
-			// Re-check file size
 			fi, err = os.Stat(s.dbPath)
 			if err != nil {
 				s.logger.Printf("LogStore: Error re-stating DB file after aggressive prune batch: %v. Stopping.", err)
 				break
 			}
-			// Optional: small delay to allow FS to update / DB to settle if VACUUM was run (it's not here)
-			// time.Sleep(100 * time.Millisecond)
 		}
 		if totalPruned > 0 {
 			s.logger.Printf("LogStore: Aggressive pruning completed. Total events deleted: %d. Current DB size: %d Bytes.", totalPruned, fi.Size())
-			// Consider running VACUUM if size doesn't drop significantly due to free pages
-			// if fi.Size() > int64(targetSizeBytes) * 1.1 { // If still significantly over
-			//     s.logger.Println("LogStore: DB size still over target after aggressive prune. Consider manual VACUUM or check for large individual events.")
-			// }
 		}
 	}
 }
@@ -286,19 +254,17 @@ func (s *LogStore) Close() error {
 	return nil
 }
 
-// runSQLiteCacheManager is the goroutine that manages the LogStore.
 func runSQLiteCacheManager(
 	logStore *LogStore,
 	logEventsIn <-chan types.LogEvent,
 	internalQuit <-chan struct{},
 	wg *sync.WaitGroup,
 	retentionDays uint32,
-	maxLogFileSizeMB *uint64, // Passed from CfgMaxLogFileSizeMB
+	maxLogFileSizeMB *uint64, 
 ) {
 	defer wg.Done()
 	logStore.logger.Println("SQLite Cache Manager goroutine started.")
 
-	// Regular retention-based pruning ticker
 	cleanupInterval := 6 * time.Hour
 	if retentionDays == 0 {
 		cleanupInterval = 24 * 365 * time.Hour
@@ -307,8 +273,7 @@ func runSQLiteCacheManager(
 	cleanupTicker := time.NewTicker(cleanupInterval)
 	defer cleanupTicker.Stop()
 
-	// DB size check and aggressive pruning ticker
-	dbSizeCheckInterval := 15 * time.Minute // Check DB size more frequently
+	dbSizeCheckInterval := 15 * time.Minute 
 	if maxLogFileSizeMB == nil || *maxLogFileSizeMB == 0 {
 		dbSizeCheckInterval = 24 * 365 * time.Hour
 		logStore.logger.Println("SQLite Cache Manager: DB size limit check disabled (no limit set).")
@@ -336,7 +301,6 @@ func runSQLiteCacheManager(
 			}
 
 		case <-dbSizeCheckTicker.C:
-			// This check now also enforces the size limit by aggressive pruning
 			logStore.CheckAndEnforceDBSize(maxLogFileSizeMB)
 
 		case <-internalQuit:
