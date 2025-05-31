@@ -1,0 +1,47 @@
+# Go build / test output
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.prof
+_output/
+_build/
+
+# Output directories from our generator
+_generated*/
+my_*/
+*_Package/
+
+# IDE / Editor specific files
+.vscode/
+.idea/
+*.suo
+*.user
+*.sln
+*.tmp
+*.swp
+*~
+*.bak
+
+# Go module files (usually committed, but good to list for clarity)
+# go.sum # Typically committed
+# go.mod # Typically committed
+
+# OS generated files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Log files (if generated in source tree during local dev, though templates put them in output)
+*.log
+client_logs/
+server_logs/
+
+# Dependency directories (if you ever use vendor/, though go modules is preferred)
+vendor/
+
+# Crash dumps
+core.*
+*.dmp
