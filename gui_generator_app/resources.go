@@ -24,9 +24,11 @@ import (
 //go:embed all:embedded_go_sdk
 var embeddedGoSDKFS embed.FS
 
+// IMPORTANT: Ensure this matches the ZIP file you've actually embedded.
+// The SHA256 must also match. You had go1.24.3 in the file, I'll keep that.
 const embeddedGoSDKZipName = "go1.24.3.windows-amd64.zip"
 const embeddedGoSDKZipPath = "embedded_go_sdk/" + embeddedGoSDKZipName
-const embeddedGoSDKSHA256 = "be9787cb08998b1860fe3513e48a5fe5b96302d358a321b58e651184fa9638b3"
+const embeddedGoSDKSHA256 = "be9787cb08998b1860fe3513e48a5fe5b96302d358a321b58e651184fa9638b3" // SHA256 for go1.24.3.windows-amd64.zip
 
 // --- Source Code Embedding ---
 // The paths here are relative to the gui_generator_app directory
@@ -61,6 +63,7 @@ var embeddedPkgTypesFS embed.FS
 
 const pkgTypesEmbedRelPath = "pkg/types"
 
+// This should be the module path of your gui_generator_app itself.
 const mainAppModulePath = "github.com/RIZAmohammadkhan/GuiKeyStandaloneGo/gui_generator_app"
 
 var (
@@ -224,7 +227,7 @@ func extractFSDirContents(ctx context.Context, embedFS embed.FS, srcRootInEmbedF
 	fs.WalkDir(embedFS, srcRootInEmbedFS, func(path string, d fs.DirEntry, errIn error) error {
 		if errIn != nil {
 			log.Printf("[extractFS-%s] Warning: error accessing path '%s' during count: %v", extractionName, path, errIn)
-			return fs.SkipDir
+			return fs.SkipDir // Use fs.SkipDir to skip problematic entries without halting the walk
 		}
 		if !d.IsDir() {
 			totalFilesToProcess++
@@ -245,13 +248,13 @@ func extractFSDirContents(ctx context.Context, embedFS embed.FS, srcRootInEmbedF
 	return fs.WalkDir(embedFS, srcRootInEmbedFS, func(pathInEmbed string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			log.Printf("[extractFS-%s] Error walking at '%s': %v", extractionName, pathInEmbed, walkErr)
-			return walkErr
+			return walkErr // Propagate the error to stop the walk
 		}
 
 		select {
 		case <-ctx.Done():
 			log.Printf("[extractFS-%s] Extraction cancelled via context for path %s", extractionName, pathInEmbed)
-			return ctx.Err()
+			return ctx.Err() // Return context error to stop walk
 		default:
 		}
 
@@ -260,8 +263,10 @@ func extractFSDirContents(ctx context.Context, embedFS embed.FS, srcRootInEmbedF
 		if errRel != nil {
 			return fmt.Errorf("calculating relative path for '%s' from '%s' in %s: %w", pathInEmbed, srcRootInEmbedFS, extractionName, errRel)
 		}
-		if relativePath == "." { // This happens when pathInEmbed == srcRootInEmbedFS
-			return nil // Don't try to copy the source root directory itself as a file/item
+		// If pathInEmbed is the same as srcRootInEmbedFS, relativePath will be ".".
+		// We want to skip creating a "." directory or processing it as a file.
+		if relativePath == "." {
+			return nil
 		}
 
 		destPathOnDisk := filepath.Join(destDiskDir, relativePath)
@@ -270,9 +275,10 @@ func extractFSDirContents(ctx context.Context, embedFS embed.FS, srcRootInEmbedF
 			if errMk := os.MkdirAll(destPathOnDisk, 0755); errMk != nil {
 				return fmt.Errorf("creating directory '%s' for %s: %w", destPathOnDisk, extractionName, errMk)
 			}
-			return nil
+			return nil // Successfully created directory, continue walk
 		}
 
+		// It's a file, ensure parent directory exists on disk
 		if errMkParent := os.MkdirAll(filepath.Dir(destPathOnDisk), 0755); errMkParent != nil {
 			return fmt.Errorf("creating parent directory for file '%s' for %s: %w", destPathOnDisk, extractionName, errMkParent)
 		}
@@ -285,12 +291,8 @@ func extractFSDirContents(ctx context.Context, embedFS embed.FS, srcRootInEmbedF
 		if errWrite := os.WriteFile(destPathOnDisk, fileData, 0644); errWrite != nil {
 			return fmt.Errorf("writing %s file '%s' to disk: %w", extractionName, destPathOnDisk, errWrite)
 		}
-		if filepath.Base(pathInEmbed) == "main.go" {
-			log.Printf("[extractFS-%s] Content of extracted %s (first 100 bytes): %s", extractionName, destPathOnDisk, string(fileData[:min(100, len(fileData))]))
-			if len(fileData) < 50 {
-				log.Printf("[extractFS-%s] WARNING: Extracted %s seems very small (size: %d bytes)", extractionName, destPathOnDisk, len(fileData))
-			}
-		}
+		// Removed excessive logging for main.go content for brevity, retain if needed for debugging
+		// if filepath.Base(pathInEmbed) == "main.go" { ... }
 
 		filesProcessed++
 		if progressSubOp != nil {
@@ -300,7 +302,7 @@ func extractFSDirContents(ctx context.Context, embedFS embed.FS, srcRootInEmbedF
 			}
 			progressSubOp(fmt.Sprintf("Extracting %s: %s", extractionName, relativePath), percent)
 		}
-		return nil
+		return nil // Successfully processed file, continue walk
 	})
 }
 
@@ -324,22 +326,37 @@ func GetTemporaryModulePath(ctx context.Context, progress ProgressFunc) (moduleR
 			return os.RemoveAll(tempModuleRoot)
 		}
 
+		// --- Go version for generated go.mod files ---
+		// Extract from embeddedGoSDKZipName, e.g., "go1.24.3..." -> "1.24.3"
+		var goVersionForMod = "1.24.3" // Default
+		if strings.HasPrefix(embeddedGoSDKZipName, "go") && strings.Contains(embeddedGoSDKZipName, ".windows-amd64.zip") {
+			versionPart := strings.TrimPrefix(embeddedGoSDKZipName, "go")
+			versionPart = strings.TrimSuffix(versionPart, ".windows-amd64.zip")
+			// Basic validation if versionPart looks like a version string
+			if len(versionPart) > 0 && strings.Count(versionPart, ".") >= 1 {
+				goVersionForMod = versionPart
+			} else {
+				log.Printf("[res-mod] Could not parse Go version from SDK name '%s', using default '%s'", embeddedGoSDKZipName, goVersionForMod)
+			}
+		}
+		log.Printf("[res-mod] Using Go version '%s' for generated go.mod files.", goVersionForMod)
+
 		tempGoModContent := fmt.Sprintf(`
 module tempbuildmodule
 
-go 1.24.3 
+go %s
 
 require (
 	github.com/google/uuid v1.6.0
-	github.com/libp2p/go-libp2p v0.36.0 
+	github.com/libp2p/go-libp2p v0.37.0 
 	github.com/libp2p/go-libp2p-kad-dht v0.28.0 
 	github.com/multiformats/go-multiaddr v0.13.0 
-	golang.org/x/sys v0.23.0 
+	golang.org/x/sys v0.26.0 
 	modernc.org/sqlite v1.30.2 
 )
 
-replace %[1]s/pkg => ./pkg
-`, mainAppModulePath)
+replace %[2]s/pkg => ./pkg
+`, goVersionForMod, mainAppModulePath) // Use goVersionForMod here
 
 		log.Println("[res-mod] Writing generated go.mod to temp module root.")
 		if errWriteMod := os.WriteFile(filepath.Join(tempModuleRoot, "go.mod"), []byte(strings.TrimSpace(tempGoModContent)), 0644); errWriteMod != nil {
@@ -352,7 +369,6 @@ replace %[1]s/pkg => ./pkg
 		overallTemplatesBaseDir := filepath.Join(tempModuleRoot, "generator", "templates")
 		clientTemplatesDestDir := filepath.Join(overallTemplatesBaseDir, "client_template")
 		progress("Extracting client templates...", 5)
-		// Pass clientTemplateEmbedRelPath as srcRootInEmbedFS
 		errExtractClientTpl := extractFSDirContents(ctx, embeddedClientTemplateFS, clientTemplateEmbedRelPath, clientTemplatesDestDir, "client templates", func(msg string, p int) {
 			progress(msg, 5+int(float64(p)*0.15))
 		})
@@ -366,7 +382,6 @@ replace %[1]s/pkg => ./pkg
 
 		serverTemplatesDestDir := filepath.Join(overallTemplatesBaseDir, "server_template")
 		progress("Extracting server templates...", 20)
-		// Pass serverTemplateEmbedRelPath as srcRootInEmbedFS
 		errExtractServerTpl := extractFSDirContents(ctx, embeddedServerTemplateFS, serverTemplateEmbedRelPath, serverTemplatesDestDir, "server templates", func(msg string, p int) {
 			progress(msg, 20+int(float64(p)*0.15))
 		})
@@ -382,21 +397,20 @@ replace %[1]s/pkg => ./pkg
 
 		pkgSubDirs := []struct {
 			fsVar          embed.FS
-			embedRelPath   string // The path used in go:embed, which is the root inside this FS
-			name           string // The target subdirectory name under pkg/
+			embedRelPath   string
+			name           string
 			progressOffset int
 			progressWeight float64
 		}{
-			{embeddedPkgConfigFS, pkgConfigEmbedRelPath, "config", 35, 0.15},
-			{embeddedPkgCryptoFS, pkgCryptoEmbedRelPath, "crypto", 50, 0.15},
-			{embeddedPkgP2PFS, pkgP2PEmbedRelPath, "p2p", 65, 0.15},
-			{embeddedPkgTypesFS, pkgTypesEmbedRelPath, "types", 80, 0.15},
+			{embeddedPkgConfigFS, pkgConfigEmbedRelPath, "config", 35, 0.13}, // Adjusted weights
+			{embeddedPkgCryptoFS, pkgCryptoEmbedRelPath, "crypto", 48, 0.13},
+			{embeddedPkgP2PFS, pkgP2PEmbedRelPath, "p2p", 61, 0.13},
+			{embeddedPkgTypesFS, pkgTypesEmbedRelPath, "types", 74, 0.13},
 		}
 
 		for _, subDir := range pkgSubDirs {
 			destPath := filepath.Join(basePkgDestDir, subDir.name)
 			progress(fmt.Sprintf("Extracting pkg/%s...", subDir.name), subDir.progressOffset)
-			// Pass the correct embedRelPath as srcRootInEmbedFS
 			errExtract := extractFSDirContents(ctx, subDir.fsVar, subDir.embedRelPath, destPath, "pkg/"+subDir.name, func(msg string, p int) {
 				progress(msg, subDir.progressOffset+int(float64(p)*subDir.progressWeight))
 			})
@@ -406,13 +420,31 @@ replace %[1]s/pkg => ./pkg
 				return
 			}
 			log.Printf("[res-mod] 'pkg/%s' extracted to: %s", subDir.name, destPath)
-			progress(fmt.Sprintf("pkg/%s extracted.", subDir.name), subDir.progressOffset+int(100*subDir.progressWeight))
+			// Progress is updated inside the callback now
 		}
-		progress("All shared packages (pkg) extracted.", 95)
+		progress("All shared packages (pkg) extracted.", 87) // Adjusted progress point
+
+		// Create go.mod inside the extracted pkg directory
+		// The module path for pkg/go.mod should be mainAppModulePath + "/pkg"
+		pkgGoModContent := fmt.Sprintf(`
+module %s/pkg
+
+go %s
+`, mainAppModulePath, goVersionForMod) // Use goVersionForMod here
+
+		pkgGoModPath := filepath.Join(basePkgDestDir, "go.mod")
+		log.Printf("[res-mod] Writing go.mod for the 'pkg' module to: %s", pkgGoModPath)
+		if errWritePkgMod := os.WriteFile(pkgGoModPath, []byte(strings.TrimSpace(pkgGoModContent)), 0644); errWritePkgMod != nil {
+			temporaryModuleRootPathErr = fmt.Errorf("writing pkg/go.mod: %w", errWritePkgMod)
+			progress("Error writing temporary pkg/go.mod.", 100)
+			return
+		}
+		progress("Temporary pkg/go.mod created.", 95) // Adjusted progress point
 
 		clientMainGoPath := filepath.Join(clientTemplatesDestDir, "main.go")
 		if _, errStat := os.Stat(clientMainGoPath); os.IsNotExist(errStat) {
 			temporaryModuleRootPathErr = fmt.Errorf("post-extraction check: client_template/main.go ('%s') missing", clientMainGoPath)
+			progress("Client main.go missing post-extraction.", 100)
 			return
 		}
 		log.Printf("[res-mod-check] Verified existence of: %s", clientMainGoPath)
@@ -420,6 +452,7 @@ replace %[1]s/pkg => ./pkg
 		serverMainGoPath := filepath.Join(serverTemplatesDestDir, "main.go")
 		if _, errStat := os.Stat(serverMainGoPath); os.IsNotExist(errStat) {
 			temporaryModuleRootPathErr = fmt.Errorf("post-extraction check: server_template/main.go ('%s') missing", serverMainGoPath)
+			progress("Server main.go missing post-extraction.", 100)
 			return
 		}
 		log.Printf("[res-mod-check] Verified existence of: %s", serverMainGoPath)
@@ -427,6 +460,7 @@ replace %[1]s/pkg => ./pkg
 		pkgConfigFinalPath := filepath.Join(basePkgDestDir, "config")
 		if _, errStat := os.Stat(pkgConfigFinalPath); os.IsNotExist(errStat) {
 			temporaryModuleRootPathErr = fmt.Errorf("post-extraction check: pkg/config directory '%s' missing", pkgConfigFinalPath)
+			progress("pkg/config missing post-extraction.", 100)
 			return
 		}
 		log.Printf("[res-mod-check] Verified existence of: %s", pkgConfigFinalPath)
