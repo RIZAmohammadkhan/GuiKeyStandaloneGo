@@ -1,15 +1,18 @@
-// GuiKeyStandaloneGo/generator/templates/client_template/p2p_manager.go
+// File: GuiKeyStandaloneGo/generator/templates/client_template/p2p_manager.go
 package main
 
 import (
 	"context"
 	"fmt"
 	"log"
+	"math"
+	"math/rand"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/RIZAmohammadkhan/GuiKeyStandaloneGo/gui_generator_app/pkg/p2p" // Your P2P protocol definitions
+	"github.com/RIZAmohammadkhan/GuiKeyStandaloneGo/gui_generator_app/pkg/p2p"
 
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
@@ -18,26 +21,195 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/routing"
-
-	// mDNS can be added back if desired for pure LAN fallback
-	// "github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	routd "github.com/libp2p/go-libp2p/p2p/discovery/routing"
-	// AutoRelay import for options
 )
 
+const (
+	// peerstoreTTL is used when caching the server's addresses in the peerstore.
+	peerstoreTTL = 2 * time.Hour
+)
+
+// ConnectionState represents the current connection state
+type ConnectionState int32
+
+const (
+	StateDisconnected ConnectionState = iota
+	StateConnecting
+	StateConnected
+	StateFailed
+)
+
+// ConnectionStats tracks connection statistics
+type ConnectionStats struct {
+	mu                  sync.RWMutex
+	totalAttempts       int64
+	successfulAttempts  int64
+	failedAttempts      int64
+	lastSuccess         time.Time
+	lastFailure         time.Time
+	consecutiveFailures int64
+}
+
+func (cs *ConnectionStats) RecordAttempt(success bool) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	cs.totalAttempts++
+	if success {
+		cs.successfulAttempts++
+		cs.lastSuccess = time.Now()
+		cs.consecutiveFailures = 0
+	} else {
+		cs.failedAttempts++
+		cs.lastFailure = time.Now()
+		cs.consecutiveFailures++
+	}
+}
+
+func (cs *ConnectionStats) GetStats() (total, success, failed, consecutive int64, lastSuccessTime, lastFailureTime time.Time) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	return cs.totalAttempts, cs.successfulAttempts, cs.failedAttempts,
+		cs.consecutiveFailures, cs.lastSuccess, cs.lastFailure
+}
+
+// BackoffManager handles exponential backoff with jitter
+type BackoffManager struct {
+	baseDelay     time.Duration
+	maxDelay      time.Duration
+	backoffFactor float64
+	jitterFactor  float64
+	attempts      int64 // only increment on genuine failures
+}
+
+func NewBackoffManager() *BackoffManager {
+	return &BackoffManager{
+		baseDelay:     1 * time.Second,
+		maxDelay:      5 * time.Minute,
+		backoffFactor: 2.0,
+		jitterFactor:  0.1,
+	}
+}
+
+// Failure returns the next delay after a genuine failure (and increments attempts).
+func (bm *BackoffManager) Failure() time.Duration {
+	idx := atomic.AddInt64(&bm.attempts, 1) - 1
+	delay := float64(bm.baseDelay) * math.Pow(bm.backoffFactor, float64(idx))
+	if delay > float64(bm.maxDelay) {
+		delay = float64(bm.maxDelay)
+	}
+	jitter := delay * bm.jitterFactor * (2*rand.Float64() - 1)
+	return time.Duration(delay + jitter)
+}
+
+func (bm *BackoffManager) Reset() {
+	atomic.StoreInt64(&bm.attempts, 0)
+}
+
+// StreamPool manages reusable streams to reduce connection overhead
+type StreamPool struct {
+	mu      sync.RWMutex
+	streams map[peer.ID]*pooledStream
+	maxAge  time.Duration
+}
+
+type pooledStream struct {
+	stream    network.Stream
+	createdAt time.Time
+	inUse     bool
+}
+
+func NewStreamPool() *StreamPool {
+	return &StreamPool{
+		streams: make(map[peer.ID]*pooledStream),
+		maxAge:  10 * time.Minute,
+	}
+}
+
+func (sp *StreamPool) Get(peerID peer.ID) network.Stream {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+
+	if ps, exists := sp.streams[peerID]; exists {
+		// Drop if closed or expired
+		if ps.stream == nil || ps.stream.Conn().IsClosed() || time.Since(ps.createdAt) >= sp.maxAge {
+			ps.stream.Reset()
+			delete(sp.streams, peerID)
+			return nil
+		}
+		if !ps.inUse {
+			ps.inUse = true
+			return ps.stream
+		}
+		return nil
+	}
+	return nil
+}
+
+func (sp *StreamPool) Put(peerID peer.ID, stream network.Stream) {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+
+	if stream == nil || stream.Conn().IsClosed() {
+		return
+	}
+	sp.streams[peerID] = &pooledStream{
+		stream:    stream,
+		createdAt: time.Now(),
+		inUse:     false,
+	}
+}
+
+func (sp *StreamPool) Remove(peerID peer.ID) {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+
+	if ps, exists := sp.streams[peerID]; exists {
+		if ps.stream != nil {
+			ps.stream.Reset()
+		}
+		delete(sp.streams, peerID)
+	}
+}
+
+func (sp *StreamPool) Cleanup() {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+
+	for peerID, ps := range sp.streams {
+		if time.Since(ps.createdAt) > sp.maxAge || ps.stream.Conn().IsClosed() {
+			if ps.stream != nil {
+				ps.stream.Reset()
+			}
+			delete(sp.streams, peerID)
+		}
+	}
+}
+
+// P2PManager manages the client’s libp2p host, DHT, and outgoing streams to the server.
 type P2PManager struct {
-	host             host.Host
-	kademliaDHT      *dht.IpfsDHT
-	routingDiscovery *routd.RoutingDiscovery
-	// AutoNAT client is managed by the host automatically
+	host               host.Host
+	kademliaDHT        *dht.IpfsDHT
+	routingDiscovery   *routd.RoutingDiscovery
 	logger             *log.Logger
 	serverPeerIDStr    string
 	bootstrapAddrInfos []peer.AddrInfo
+
+	connectionState     atomic.Int32 // use atomic.Int32 for ConnectionState
+	connectionStats     *ConnectionStats
+	backoffManager      *BackoffManager
+	streamPool          *StreamPool
+	ctx                 context.Context
+	cancel              context.CancelFunc
+	shutdownWg          sync.WaitGroup
+	lastServerContact   time.Time
+	healthCheckInterval time.Duration
+	rateLimiter         chan struct{} // limit concurrent SendLogBatch
 }
 
 func NewP2PManager(logger *log.Logger, serverPeerID string, bootstrapAddrs []string) (*P2PManager, error) {
 	if logger == nil {
-		logger = log.New(os.Stdout, "P2P_CLIENT_FALLBACK: ", log.LstdFlags|log.Lshortfile)
+		logger = log.New(os.Stdout, "P2P_CLIENT: ", log.LstdFlags|log.Lshortfile)
 	}
 
 	var bootAddrsInfo []peer.AddrInfo
@@ -47,26 +219,27 @@ func NewP2PManager(logger *log.Logger, serverPeerID string, bootstrapAddrs []str
 		}
 		ai, err := peer.AddrInfoFromString(addrStr)
 		if err != nil {
-			logger.Printf("P2P Client WARN: Invalid bootstrap address string '%s': %v", addrStr, err)
+			logger.Printf("WARN: Invalid bootstrap address '%s': %v", addrStr, err)
 			continue
 		}
 		bootAddrsInfo = append(bootAddrsInfo, *ai)
 	}
+
 	if len(bootAddrsInfo) == 0 {
-		logger.Println("P2P Client WARN: No valid bootstrap addresses configured. DHT discovery will be severely limited unless on LAN with mDNS.")
+		logger.Println("WARN: No valid bootstrap addresses; DHT functionality limited")
 	}
 
 	var opts []libp2p.Option
-	opts = append(opts, libp2p.ListenAddrStrings(
-		"/ip4/0.0.0.0/tcp/0",
-		"/ip4/0.0.0.0/udp/0/quic-v1", // Enable QUIC
-	))
-	opts = append(opts, libp2p.EnableRelay())
-	opts = append(opts, libp2p.EnableHolePunching())
-	// AutoNAT is enabled by default in newer versions, no explicit call needed
+	opts = append(opts,
+		libp2p.ListenAddrStrings(
+			"/ip4/0.0.0.0/tcp/0",
+			"/ip4/0.0.0.0/udp/0/quic-v1",
+		),
+		libp2p.EnableRelay(),
+		libp2p.EnableHolePunching(),
+	)
 
 	if len(bootAddrsInfo) > 0 {
-		// Fixed: EnableAutoRelayWithStaticRelays now requires autorelay options
 		opts = append(opts, libp2p.EnableAutoRelayWithStaticRelays(bootAddrsInfo))
 	} else {
 		opts = append(opts, libp2p.EnableAutoRelay())
@@ -77,9 +250,6 @@ func NewP2PManager(logger *log.Logger, serverPeerID string, bootstrapAddrs []str
 		libp2p.Routing(func(h host.Host) (routing.PeerRouting, error) {
 			var err error
 			dhtOpts := []dht.Option{dht.Mode(dht.ModeClient)}
-			// DHT will use connected peers (like bootstrap) automatically,
-			// but explicitly providing them to dht.New can also be done.
-			// dht.BootstrapPeers is good for the initial bootstrap call later.
 			kadDHT, err = dht.New(context.Background(), h, dhtOpts...)
 			return kadDHT, err
 		}),
@@ -87,265 +257,452 @@ func NewP2PManager(logger *log.Logger, serverPeerID string, bootstrapAddrs []str
 
 	p2pHost, err := libp2p.New(opts...)
 	if err != nil {
-		return nil, fmt.Errorf("p2p client: failed to create libp2p host: %w", err)
+		return nil, fmt.Errorf("failed to create libp2p host: %w", err)
 	}
-	logger.Printf("P2P Client: Host created with ID: %s", p2pHost.ID().String())
-
 	if kadDHT == nil {
 		p2pHost.Close()
-		return nil, fmt.Errorf("p2p client: Kademlia DHT was not initialized during host setup")
+		return nil, fmt.Errorf("Kademlia DHT was not initialized")
 	}
-	logger.Println("P2P Client: AutoNAT service and Kademlia DHT initialized with host.")
 
-	return &P2PManager{
-		host:               p2pHost,
-		kademliaDHT:        kadDHT,
-		logger:             logger,
-		serverPeerIDStr:    serverPeerID,
-		bootstrapAddrInfos: bootAddrsInfo,
-	}, nil
+	ctx, cancel := context.WithCancel(context.Background())
+	pm := &P2PManager{
+		host:                p2pHost,
+		kademliaDHT:         kadDHT,
+		logger:              logger,
+		serverPeerIDStr:     serverPeerID,
+		bootstrapAddrInfos:  bootAddrsInfo,
+		connectionStats:     &ConnectionStats{},
+		backoffManager:      NewBackoffManager(),
+		streamPool:          NewStreamPool(),
+		ctx:                 ctx,
+		cancel:              cancel,
+		healthCheckInterval: 30 * time.Second,
+		rateLimiter:         make(chan struct{}, 10),
+	}
+	pm.connectionState.Store(int32(StateDisconnected))
+
+	logger.Printf("Client libp2p host created with ID: %s", p2pHost.ID().String())
+	return pm, nil
 }
 
 func (pm *P2PManager) StartDiscoveryAndBootstrap(ctx context.Context) {
-	pm.logger.Println("P2P Client: Starting discovery and bootstrap processes...")
+	pm.logger.Println("Client: Starting discovery and bootstrap...")
 
 	if len(pm.bootstrapAddrInfos) == 0 {
-		pm.logger.Println("P2P Client: No bootstrap peers configured. DHT may not function effectively.")
-		// Consider if mDNS should be started as a fallback for LAN here
-		// pm.startMDNS(ctx)
-		return // Still start other goroutines like findServer, address monitor
+		pm.logger.Println("Client: No bootstrap peers; DHT will be limited")
+		return
 	}
 
-	// Initial connection attempt to bootstrap peers
+	pm.shutdownWg.Add(4)
+	go pm.bootstrapManager()
+	go pm.serverConnectionManager()
+	go pm.addressMonitor()
+	go pm.cleanupManager()
+
+	// Initial attempt to connect to any bootstrap peers
 	pm.connectToBootstrapPeers(ctx)
+}
 
-	// Goroutine for periodic bootstrap retries and DHT re-bootstrap
-	go func() {
-		// Short initial delay, then longer periodic bootstraps
-		initialBootstrapTimer := time.NewTimer(30 * time.Second) // Increased initial delay
-		defer initialBootstrapTimer.Stop()
+func (pm *P2PManager) bootstrapManager() {
+	defer pm.shutdownWg.Done()
+	defer pm.logger.Println("Client: Bootstrap manager stopped")
 
-		bootstrapRetryTicker := time.NewTicker(5 * time.Minute)
-		defer bootstrapRetryTicker.Stop()
-		dhtReBootstrapTicker := time.NewTicker(20 * time.Minute) // Less frequent re-bootstrap
-		defer dhtReBootstrapTicker.Stop()
+	initialTimer := time.NewTimer(30 * time.Second)
+	defer initialTimer.Stop()
 
-		firstBootstrapDone := false
+	retryTicker := time.NewTicker(3 * time.Minute)
+	defer retryTicker.Stop()
 
-		for {
-			select {
-			case <-ctx.Done():
-				pm.logger.Println("P2P Client: Bootstrap/Discovery supervisor goroutine stopping.")
-				return
-			case <-initialBootstrapTimer.C:
-				if !firstBootstrapDone {
-					pm.logger.Println("P2P Client: Attempting initial Kademlia DHT bootstrap...")
-					if err := pm.kademliaDHT.Bootstrap(ctx); err != nil {
-						pm.logger.Printf("P2P Client: Initial Kademlia DHT bootstrap failed: %v (will retry via ticker)", err)
-					} else {
-						pm.logger.Println("P2P Client: Initial Kademlia DHT bootstrap process completed/initiated.")
-					}
-					pm.routingDiscovery = routd.NewRoutingDiscovery(pm.kademliaDHT)
-					firstBootstrapDone = true
-				}
-			case <-bootstrapRetryTicker.C:
-				pm.logger.Println("P2P Client: Periodically retrying connections to bootstrap peers...")
-				pm.connectToBootstrapPeers(ctx)
-			case <-dhtReBootstrapTicker.C:
-				pm.logger.Println("P2P Client: Periodically re-bootstrapping Kademlia DHT...")
-				if err := pm.kademliaDHT.Bootstrap(ctx); err != nil { // Bootstrap again
-					pm.logger.Printf("P2P Client: Periodic Kademlia DHT bootstrap failed: %v", err)
+	dhtTicker := time.NewTicker(15 * time.Minute)
+	defer dhtTicker.Stop()
+
+	firstBootstrapDone := false
+
+	for {
+		select {
+		case <-pm.ctx.Done():
+			return
+		case <-initialTimer.C:
+			if !firstBootstrapDone {
+				pm.logger.Println("Client: Performing initial DHT bootstrap...")
+				if err := pm.kademliaDHT.Bootstrap(pm.ctx); err != nil {
+					pm.logger.Printf("Client: initial DHT bootstrap failed: %v", err)
 				} else {
-					pm.logger.Println("P2P Client: Periodic Kademlia DHT bootstrap initiated.")
+					pm.logger.Println("Client: initial DHT bootstrap succeeded")
+					pm.routingDiscovery = routd.NewRoutingDiscovery(pm.kademliaDHT)
 				}
+				firstBootstrapDone = true
+			}
+		case <-retryTicker.C:
+			if pm.ctx.Err() != nil {
+				return
+			}
+			pm.logger.Println("Client: Retrying bootstrap peer connections...")
+			pm.connectToBootstrapPeers(pm.ctx)
+		case <-dhtTicker.C:
+			if pm.ctx.Err() != nil {
+				return
+			}
+			pm.logger.Println("Client: Performing periodic DHT bootstrap...")
+			if err := pm.kademliaDHT.Bootstrap(pm.ctx); err != nil {
+				pm.logger.Printf("Client: periodic DHT bootstrap failed: %v", err)
 			}
 		}
-	}()
-
-	go pm.periodicallyFindServer(ctx)
-	go pm.monitorAddressAndNATChanges(ctx)
+	}
 }
 
 func (pm *P2PManager) connectToBootstrapPeers(ctx context.Context) {
 	if len(pm.bootstrapAddrInfos) == 0 {
 		return
 	}
-	pm.logger.Printf("P2P Client: Attempting to connect to %d bootstrap peers if not already connected...", len(pm.bootstrapAddrInfos))
+	pm.logger.Printf("Client: Attempting to connect to %d bootstrap peers...", len(pm.bootstrapAddrInfos))
+
 	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, 5) // limit concurrent dials
+
 	for _, pi := range pm.bootstrapAddrInfos {
 		if pm.host.Network().Connectedness(pi.ID) == network.Connected {
-			continue // Skip if already connected
+			continue
 		}
 		wg.Add(1)
 		go func(peerInfo peer.AddrInfo) {
 			defer wg.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
 			connectCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 			defer cancel()
 			if err := pm.host.Connect(connectCtx, peerInfo); err != nil {
-				// These logs can be noisy if bootstrap nodes are flaky, consider reducing verbosity for repeated failures
-				// pm.logger.Printf("P2P Client: Failed to connect to bootstrap peer %s (%v): %v", peerInfo.ID, peerInfo.Addrs, err)
+				if ctx.Err() == nil {
+					pm.logger.Printf("Client: failed to connect to bootstrap peer %s: %v", peerInfo.ID, err)
+				}
 			} else {
-				pm.logger.Printf("P2P Client: Successfully connected to bootstrap peer: %s", peerInfo.ID.String())
+				pm.logger.Printf("Client: successfully connected to bootstrap peer: %s", peerInfo.ID.String())
 			}
 		}(pi)
 	}
-	// Don't wait with wg.Wait() to allow them to connect in the background
-}
 
-func (pm *P2PManager) monitorAddressAndNATChanges(ctx context.Context) {
-	addrSub, err := pm.host.EventBus().Subscribe(new(event.EvtLocalAddressesUpdated))
-	if err != nil {
-		pm.logger.Printf("P2P Client: Failed to subscribe to address update events: %v", err)
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Minute):
+		pm.logger.Println("Client: bootstrap connection attempts timed out")
+	case <-ctx.Done():
 		return
 	}
-	defer addrSub.Close()
-
-	// Subscribe to NAT status change events (reachability events)
-	reachabilitySub, err := pm.host.EventBus().Subscribe(new(event.EvtLocalReachabilityChanged))
-	if err != nil {
-		pm.logger.Printf("P2P Client: Failed to subscribe to reachability events: %v", err)
-	} else {
-		defer reachabilitySub.Close()
-	}
-
-	pm.logger.Printf("P2P Client: Initial Listen Addresses: %v", pm.host.Addrs())
-
-	for {
-		select {
-		case <-ctx.Done():
-			pm.logger.Println("P2P Client: Address/NAT monitor stopping.")
-			return
-		case ev, ok := <-addrSub.Out():
-			if !ok {
-				addrSub = nil
-				if reachabilitySub == nil {
-					return
-				}
-				continue
-			}
-			addressEvent := ev.(event.EvtLocalAddressesUpdated)
-			// Fixed: Use Current and Diffs instead of Listen (which doesn't exist)
-			pm.logger.Printf("P2P Client: Host addresses updated. Current: %v. Diffs: %+v", addressEvent.Current, addressEvent.Diffs)
-		case ev, ok := <-reachabilitySub.Out():
-			if !ok {
-				reachabilitySub = nil
-				if addrSub == nil {
-					return
-				}
-				continue
-			}
-			// Fixed: Use EvtLocalReachabilityChanged instead of autonat.Event
-			reachabilityEvent := ev.(event.EvtLocalReachabilityChanged)
-			pm.logger.Printf("P2P Client: Reachability status changed: %s", reachabilityEvent.Reachability.String())
-		}
-	}
 }
 
-func (pm *P2PManager) periodicallyFindServer(ctx context.Context) {
+func (pm *P2PManager) serverConnectionManager() {
+	defer pm.shutdownWg.Done()
+	defer pm.logger.Println("Client: Server connection manager stopped")
+
 	if pm.serverPeerIDStr == "" {
+		pm.logger.Println("Client: No server PeerID configured")
 		return
 	}
+
 	targetPeerID, err := peer.Decode(pm.serverPeerIDStr)
 	if err != nil {
-		pm.logger.Printf("P2P Client: Invalid server PeerID for periodic find: %v", err)
+		pm.logger.Printf("Client: invalid server PeerID: %v", err)
 		return
 	}
 
-	ticker := time.NewTicker(1 * time.Minute) // Check server reachability more often
+	ticker := time.NewTicker(pm.healthCheckInterval)
 	defer ticker.Stop()
 
-	// Initial attempt
-	pm.findAndConnectToServer(ctx, targetPeerID)
+	// Initial connection attempt
+	pm.findAndConnectToServer(pm.ctx, targetPeerID)
 
 	for {
 		select {
-		case <-ctx.Done():
+		case <-pm.ctx.Done():
 			return
 		case <-ticker.C:
-			pm.findAndConnectToServer(ctx, targetPeerID)
+			if pm.shouldAttemptConnection(targetPeerID) {
+				pm.findAndConnectToServer(pm.ctx, targetPeerID)
+			}
 		}
 	}
+}
+
+func (pm *P2PManager) shouldAttemptConnection(targetPeerID peer.ID) bool {
+	// If already connected and last contact was recent, skip.
+	if pm.host.Network().Connectedness(targetPeerID) == network.Connected {
+		if time.Since(pm.lastServerContact) < pm.healthCheckInterval*2 {
+			return false
+		}
+	}
+
+	// Check backoff
+	_, _, _, consecutive, _, lastFailure := pm.connectionStats.GetStats()
+	if consecutive > 0 {
+		backoffDelay := pm.backoffManager.Failure() // get delay for last failure
+		if time.Since(lastFailure) < backoffDelay {
+			return false
+		}
+	}
+
+	return true
 }
 
 func (pm *P2PManager) findAndConnectToServer(ctx context.Context, targetPeerID peer.ID) {
-	if pm.host.Network().Connectedness(targetPeerID) == network.Connected {
+	currentState := ConnectionState(pm.connectionState.Load())
+	if currentState == StateConnecting {
 		return
 	}
-	pm.logger.Printf("P2P Client: Attempting to find server %s via DHT...", targetPeerID)
+
+	pm.connectionState.Store(int32(StateConnecting))
+	pm.logger.Printf("Client: Attempting to find and connect to server %s...", targetPeerID)
+
+	// 1) Try direct connection if addresses cached
+	if addrs := pm.host.Peerstore().Addrs(targetPeerID); len(addrs) > 0 {
+		connectCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		if err := pm.host.Connect(connectCtx, peer.AddrInfo{ID: targetPeerID, Addrs: addrs}); err == nil {
+			pm.onConnectionSuccess(targetPeerID)
+			return
+		}
+	}
+
+	// 2) Fall back to DHT lookup
 	findCtx, findCancel := context.WithTimeout(ctx, 45*time.Second)
 	defer findCancel()
 
 	peerInfo, err := pm.kademliaDHT.FindPeer(findCtx, targetPeerID)
 	if err != nil {
-		pm.logger.Printf("P2P Client: Could not find server %s via DHT: %v", targetPeerID, err)
+		pm.onConnectionFailure(targetPeerID, fmt.Errorf("DHT find peer failed: %w", err))
 		return
 	}
-	pm.logger.Printf("P2P Client: Found server %s via DHT at addrs: %v. Attempting connect.", targetPeerID, peerInfo.Addrs)
-	pm.host.Peerstore().AddAddrs(peerInfo.ID, peerInfo.Addrs, 2*time.Hour)
+	pm.logger.Printf("Client: Found server %s via DHT at addrs: %v", targetPeerID, peerInfo.Addrs)
+
+	pm.host.Peerstore().AddAddrs(peerInfo.ID, peerInfo.Addrs, peerstoreTTL)
 
 	connectCtx, connectCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer connectCancel()
-	err = pm.host.Connect(connectCtx, peerInfo)
-	if err != nil {
-		pm.logger.Printf("P2P Client: Failed to connect to server %s found via DHT: %v", targetPeerID, err)
-	} else {
-		pm.logger.Printf("P2P Client: Successfully connected to server %s found via DHT.", targetPeerID)
+	if err := pm.host.Connect(connectCtx, peerInfo); err != nil {
+		pm.onConnectionFailure(targetPeerID, fmt.Errorf("dial failed: %w", err))
+		return
+	}
+	pm.onConnectionSuccess(targetPeerID)
+}
+
+func (pm *P2PManager) onConnectionSuccess(peerID peer.ID) {
+	pm.connectionState.Store(int32(StateConnected))
+	pm.connectionStats.RecordAttempt(true)
+	pm.backoffManager.Reset()
+
+	pm.lastServerContact = time.Now()
+	pm.logger.Printf("Client: Successfully connected to server %s", peerID)
+}
+
+func (pm *P2PManager) onConnectionFailure(peerID peer.ID, err error) {
+	pm.connectionState.Store(int32(StateFailed))
+	delay := pm.backoffManager.Failure()
+	pm.connectionStats.RecordAttempt(false)
+
+	if pm.ctx.Err() == nil {
+		pm.logger.Printf("Client: Failed to connect to server %s: %v (backoff %s)", peerID, err, delay)
 	}
 }
 
+func (pm *P2PManager) addressMonitor() {
+	defer pm.shutdownWg.Done()
+	defer pm.logger.Println("Client: Address monitor stopped")
+
+	addrSub, err := pm.host.EventBus().Subscribe(new(event.EvtLocalAddressesUpdated))
+	if err != nil {
+		pm.logger.Printf("Client: failed to subscribe to address updates: %v", err)
+		return
+	}
+	defer addrSub.Close()
+
+	reachabilitySub, err := pm.host.EventBus().Subscribe(new(event.EvtLocalReachabilityChanged))
+	if err != nil {
+		pm.logger.Printf("Client: failed to subscribe to reachability events: %v", err)
+	} else {
+		defer reachabilitySub.Close()
+	}
+
+	pm.logger.Printf("Client: Initial listen addresses: %v", pm.host.Addrs())
+
+	for {
+		select {
+		case <-pm.ctx.Done():
+			return
+		case ev, ok := <-addrSub.Out():
+			if !ok {
+				if reachabilitySub == nil {
+					return
+				}
+				addrSub = nil
+				continue
+			}
+			addressEvent := ev.(event.EvtLocalAddressesUpdated)
+			pm.logger.Printf("Client: Addresses updated. Current: %v, Diffs: %+v",
+				addressEvent.Current, addressEvent.Diffs)
+		case ev, ok := <-reachabilitySub.Out():
+			if !ok {
+				if addrSub == nil {
+					return
+				}
+				reachabilitySub = nil
+				continue
+			}
+			reachabilityEvent := ev.(event.EvtLocalReachabilityChanged)
+			pm.logger.Printf("Client: Reachability changed: %s",
+				reachabilityEvent.Reachability.String())
+		}
+	}
+}
+
+func (pm *P2PManager) cleanupManager() {
+	defer pm.shutdownWg.Done()
+	defer pm.logger.Println("Client: Cleanup manager stopped")
+
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-pm.ctx.Done():
+			return
+		case <-ticker.C:
+			pm.streamPool.Cleanup()
+		}
+	}
+}
+
+// SendLogBatch sends client’s log batch to server, reusing a pooled stream if possible.
+// It always checks that resp.Header.RequestID == req.Header.RequestID.
 func (pm *P2PManager) SendLogBatch(ctx context.Context, clientAppID string, encryptedPayload []byte) (*p2p.LogBatchResponse, error) {
+	// Rate limiting
+	select {
+	case pm.rateLimiter <- struct{}{}:
+		defer func() { <-pm.rateLimiter }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(5 * time.Second):
+		return nil, fmt.Errorf("rate limit exceeded: too many concurrent requests")
+	}
+
 	if pm.serverPeerIDStr == "" {
-		return nil, fmt.Errorf("p2p client: server PeerID is not configured")
+		return nil, fmt.Errorf("server PeerID not configured")
 	}
 	targetPeerID, err := peer.Decode(pm.serverPeerIDStr)
 	if err != nil {
-		return nil, fmt.Errorf("p2p client: invalid server PeerID string '%s': %w", pm.serverPeerIDStr, err)
+		return nil, fmt.Errorf("invalid server PeerID '%s': %w", pm.serverPeerIDStr, err)
 	}
 
-	pm.logger.Printf("P2P Client: Attempting to open stream to server %s for protocol %s", targetPeerID, p2p.ProtocolID)
-	streamCtx, cancelStream := context.WithTimeout(ctx, 30*time.Second)
-	defer cancelStream()
-
-	stream, err := pm.host.NewStream(streamCtx, targetPeerID, p2p.ProtocolID)
-	if err != nil {
-		return nil, fmt.Errorf("p2p client: failed to open new stream to server %s: %w", targetPeerID, err)
-	}
-	defer stream.Reset()
-	pm.logger.Printf("P2P Client: Stream opened to server %s", targetPeerID)
-
-	_ = stream.SetWriteDeadline(time.Now().Add(30 * time.Second))
-	_ = stream.SetReadDeadline(time.Now().Add(60 * time.Second))
-
-	response, err := p2p.SendLogBatchAndGetResponse(stream, clientAppID, encryptedPayload)
-	if err != nil {
-		return nil, fmt.Errorf("p2p client: error during log batch send/receive: %w", err)
+	// Check if connected
+	if pm.host.Network().Connectedness(targetPeerID) != network.Connected {
+		return nil, fmt.Errorf("not connected to server %s", targetPeerID)
 	}
 
-	pm.logger.Printf("P2P Client: Received response from server: Status='%s', Msg='%s', Processed=%d",
-		response.Status, response.Message, response.EventsProcessed)
-	return response, nil
+	// Try pooled stream first
+	stream := pm.streamPool.Get(targetPeerID)
+	if stream == nil {
+		streamCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		stream, err = pm.host.NewStream(streamCtx, targetPeerID, p2p.ProtocolID)
+		if err != nil {
+			pm.streamPool.Remove(targetPeerID)
+			return nil, fmt.Errorf("failed to open new stream to server %s: %w", targetPeerID, err)
+		}
+		pm.logger.Printf("Client: Created new stream to server %s", targetPeerID)
+	}
+
+	// Ensure stream is returned to pool if healthy, otherwise closed
+	defer func() {
+		if stream != nil && stream.Conn() != nil && !stream.Conn().IsClosed() {
+			pm.streamPool.Put(targetPeerID, stream)
+		} else if stream != nil {
+			stream.Reset()
+		}
+	}()
+
+	// Build and send request
+	req := p2p.LogBatchRequest{
+		Header:              p2p.NewMessageHeader(p2p.MessageTypeLogBatch),
+		AppClientID:         clientAppID,
+		EncryptedLogPayload: encryptedPayload,
+	}
+	if err := p2p.WriteMessageWithTimeout(stream, &req, 30*time.Second); err != nil {
+		return nil, fmt.Errorf("failed to write LogBatchRequest: %w", err)
+	}
+
+	// Read response
+	var resp p2p.LogBatchResponse
+	if err := p2p.ReadMessageWithTimeout(stream, &resp, 60*time.Second); err != nil {
+		return nil, fmt.Errorf("failed to read LogBatchResponse: %w", err)
+	}
+
+	// Validate message type
+	if resp.Header.MessageType != p2p.MessageTypeLogBatch && resp.Header.MessageType != p2p.MessageTypeError {
+		return nil, fmt.Errorf("unexpected response message type: %s", resp.Header.MessageType)
+	}
+
+	// Validate RequestID matches
+	if resp.Header.RequestID != req.Header.RequestID {
+		return nil, fmt.Errorf("response RequestID mismatch: expected %s, got %s",
+			req.Header.RequestID, resp.Header.RequestID)
+	}
+
+	return &resp, nil
 }
 
+// GetConnectionStats returns the current ConnectionState and stats object.
+func (pm *P2PManager) GetConnectionStats() (ConnectionState, *ConnectionStats) {
+	state := ConnectionState(pm.connectionState.Load())
+	return state, pm.connectionStats
+}
+
+// Close gracefully shuts down background goroutines, DHT, and host.
 func (pm *P2PManager) Close() error {
-	// AutoNAT client associated with the host is closed when the host is closed.
-	// No explicit autoNATClient.Close() needed.
+	pm.logger.Println("Client: Shutting down P2P Manager...")
+
+	// Cancel context to stop everything
+	pm.cancel()
+
+	// Wait for background goroutines
+	done := make(chan struct{})
+	go func() {
+		pm.shutdownWg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		pm.logger.Println("Client: Background goroutines stopped")
+	case <-time.After(10 * time.Second):
+		pm.logger.Println("Client: Timeout waiting for background goroutines")
+	}
+
+	// Clean up stream pool
+	pm.streamPool.Cleanup()
+
+	// Close DHT
 	if pm.kademliaDHT != nil {
 		if err := pm.kademliaDHT.Close(); err != nil {
-			pm.logger.Printf("P2P Client: Error closing Kademlia DHT: %v", err)
-			// Don't return early, try to close host too
+			pm.logger.Printf("Client: Error closing DHT: %v", err)
 		}
 	}
+
+	// Close host
 	if pm.host != nil {
-		pm.logger.Println("P2P Client: Closing libp2p host...")
+		pm.logger.Println("Client: Closing libp2p host...")
 		return pm.host.Close()
 	}
 	return nil
 }
 
+// runP2PManager is a helper if you spawn the P2P manager in its own goroutine.
 func runP2PManager(p2pManager *P2PManager, internalQuit <-chan struct{}, wg *sync.WaitGroup, logger *log.Logger) {
 	defer wg.Done()
-	// Use the P2PManager's own logger
-	p2pManager.logger.Println("P2P Client Manager goroutine starting.")
+	p2pManager.logger.Println("Client P2P Manager goroutine starting.")
 
 	p2pCtx, cancelP2pCtx := context.WithCancel(context.Background())
 	defer cancelP2pCtx()
@@ -353,5 +710,5 @@ func runP2PManager(p2pManager *P2PManager, internalQuit <-chan struct{}, wg *syn
 	p2pManager.StartDiscoveryAndBootstrap(p2pCtx)
 
 	<-internalQuit
-	p2pManager.logger.Println("P2P Client Manager goroutine stopping...")
+	p2pManager.logger.Println("Client P2P Manager goroutine stopping...")
 }
