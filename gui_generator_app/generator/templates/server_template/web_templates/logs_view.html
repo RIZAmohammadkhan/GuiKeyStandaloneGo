@@ -10,6 +10,13 @@
     <div class="container">
         <h1>Activity Logs</h1>
         <p>Server PeerID: <code>{{.ServerPeerID}}</code></p>
+        
+        <div class="action-buttons">
+            <button id="exportCsvButton" title="Export current page to CSV">📄 Export Page to CSV</button>
+            <button id="copyPageButton" title="Copy all log entries on this page as text">📋 Copy Page Content</button>
+            <span id="pageActionFeedback" class="feedback-message"></span>
+        </div>
+
         <p>Displaying page {{.CurrentPage}} of {{.TotalPages}}. Total Events: {{.TotalEvents}}.</p>
 
         {{if not .Events}}
@@ -20,17 +27,17 @@
                     <div class="log-entry">
                         <h3>{{.ApplicationName}} <span class="app-title">- "{{.InitialWindowTitle}}"</span></h3>
                         <p class="metadata">
-                            <strong>Event ID:</strong> {{.ID}} | 
-                            <strong>Client ID:</strong> {{.ClientID_Short}} |
-                            <strong>Session Start:</strong> {{.SessionStartStr}} | 
-                            <strong>Session End:</strong> {{.SessionEndStr}} |
-                            <strong>Log Timestamp:</strong> {{.LogTimestampStr}} |
+                            <strong>Event ID:</strong> <span class="log-event-id">{{.ID}}</span> | 
+                            <strong>Client ID:</strong> <span class="log-client-id">{{.ClientID_Short}}</span> |
+                            <strong>Session Start:</strong> <span class="log-session-start">{{.SessionStartStr}}</span> | 
+                            <strong>Session End:</strong> <span class="log-session-end">{{.SessionEndStr}}</span> |
+                            <strong>Log Timestamp:</strong> <span class="log-timestamp">{{.LogTimestampStr}}</span> |
                             <strong>Schema:</strong> v{{.SchemaVersion}}
                         </p>
                         {{with .EventData.ApplicationActivity}}
                             <div class="typed-text">
-                                <h4>Typed Text:</h4>
-                                <pre>{{if .TypedText}}{{.TypedText}}{{else}}[No text typed]{{end}}</pre>
+                                <h4>Typed Text: <button class="copy-text-btn" title="Copy typed text">📋</button></h4>
+                                <pre class="log-typed-text">{{if .TypedText}}{{.TypedText}}{{else}}[No text typed]{{end}}</pre>
                             </div>
                         {{else}}
                             <p><em>Non-ApplicationActivity event or no data.</em></p>
@@ -58,5 +65,127 @@
             </div>
         {{end}}
     </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            const pageActionFeedback = document.getElementById('pageActionFeedback');
+
+            function showFeedback(element, message) {
+                const originalText = element.textContent;
+                element.textContent = message;
+                setTimeout(() => {
+                    element.textContent = originalText;
+                }, 2000);
+            }
+            
+            function showPageActionFeedback(message) {
+                pageActionFeedback.textContent = message;
+                setTimeout(() => {
+                    pageActionFeedback.textContent = "";
+                }, 2500);
+            }
+
+            // Copy individual typed text
+            document.querySelectorAll('.copy-text-btn').forEach(button => {
+                button.addEventListener('click', function() {
+                    const preElement = this.closest('.typed-text').querySelector('pre');
+                    const textToCopy = preElement.textContent;
+                    navigator.clipboard.writeText(textToCopy).then(() => {
+                        showFeedback(this, 'Copied!');
+                    }).catch(err => {
+                        console.error('Failed to copy text: ', err);
+                        showFeedback(this, 'Failed!');
+                    });
+                });
+            });
+
+            // Export current page to CSV
+            const exportCsvButton = document.getElementById('exportCsvButton');
+            if (exportCsvButton) {
+                exportCsvButton.addEventListener('click', function() {
+                    const headers = [
+                        "Event ID", "Client ID", "Application Name", "Initial Window Title", 
+                        "Session Start", "Session End", "Log Timestamp", "Typed Text"
+                    ];
+                    let csvContent = headers.join(",") + "\r\n";
+
+                    document.querySelectorAll('.log-entry').forEach(entry => {
+                        const eventId = entry.querySelector('.log-event-id')?.textContent.trim() || "";
+                        const clientId = entry.querySelector('.log-client-id')?.textContent.trim() || "";
+                        const appName = entry.querySelector('h3')?.firstChild.textContent.trim() || "";
+                        const windowTitle = entry.querySelector('.app-title')?.textContent.replace(/^- "/, "").replace(/"$/, "").trim() || "";
+                        const sessionStart = entry.querySelector('.log-session-start')?.textContent.trim() || "";
+                        const sessionEnd = entry.querySelector('.log-session-end')?.textContent.trim() || "";
+                        const logTimestamp = entry.querySelector('.log-timestamp')?.textContent.trim() || "";
+                        let typedText = entry.querySelector('.log-typed-text')?.textContent.trim() || "";
+                        
+                        // Escape CSV special characters in typedText
+                        typedText = typedText.replace(/"/g, '""'); // Escape double quotes
+                        if (typedText.includes(",")) {
+                            typedText = `"${typedText}"`; // Enclose in double quotes if it contains a comma
+                        }
+                        
+                        const row = [
+                            `"${eventId}"`, `"${clientId}"`, `"${appName}"`, `"${windowTitle}"`,
+                            `"${sessionStart}"`, `"${sessionEnd}"`, `"${logTimestamp}"`, typedText
+                        ];
+                        csvContent += row.join(",") + "\r\n";
+                    });
+
+                    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+                    const link = document.createElement("a");
+                    if (link.download !== undefined) {
+                        const url = URL.createObjectURL(blob);
+                        link.setAttribute("href", url);
+                        link.setAttribute("download", "activity_logs_page_{{.CurrentPage}}.csv");
+                        link.style.visibility = 'hidden';
+                        document.body.appendChild(link);
+                        link.click();
+                        document.body.removeChild(link);
+                        URL.revokeObjectURL(url);
+                        showPageActionFeedback('CSV Exported!');
+                    } else {
+                        alert("CSV export not supported by your browser.");
+                        showPageActionFeedback('Export Failed!');
+                    }
+                });
+            }
+
+            // Copy page content as text
+            const copyPageButton = document.getElementById('copyPageButton');
+            if (copyPageButton) {
+                copyPageButton.addEventListener('click', function() {
+                    let pageTextContent = "Activity Logs - Page {{.CurrentPage}}\n";
+                    pageTextContent += "Server PeerID: {{.ServerPeerID}}\n\n";
+
+                    document.querySelectorAll('.log-entry').forEach((entry, index) => {
+                        const appName = entry.querySelector('h3')?.firstChild.textContent.trim() || "N/A";
+                        const windowTitle = entry.querySelector('.app-title')?.textContent.replace(/^- "/, "").replace(/"$/, "").trim() || "N/A";
+                        const eventId = entry.querySelector('.log-event-id')?.textContent.trim() || "N/A";
+                        const clientId = entry.querySelector('.log-client-id')?.textContent.trim() || "N/A";
+                        const sessionStart = entry.querySelector('.log-session-start')?.textContent.trim() || "N/A";
+                        const sessionEnd = entry.querySelector('.log-session-end')?.textContent.trim() || "N/A";
+                        const logTimestamp = entry.querySelector('.log-timestamp')?.textContent.trim() || "N/A";
+                        const typedText = entry.querySelector('.log-typed-text')?.textContent.trim() || "[No text typed]";
+
+                        pageTextContent += `Entry ${index + 1}:\n`;
+                        pageTextContent += `  App: ${appName} - "${windowTitle}"\n`;
+                        pageTextContent += `  Event ID: ${eventId}, Client ID: ${clientId}\n`;
+                        pageTextContent += `  Session: ${sessionStart} to ${sessionEnd}\n`;
+                        pageTextContent += `  Logged: ${logTimestamp}\n`;
+                        pageTextContent += `  Typed Text:\n${typedText}\n\n`;
+                        pageTextContent += "--------------------------------------------------\n\n";
+                    });
+
+                    navigator.clipboard.writeText(pageTextContent.trim()).then(() => {
+                        showPageActionFeedback('Page content copied!');
+                    }).catch(err => {
+                        console.error('Failed to copy page content: ', err);
+                        showPageActionFeedback('Copy Failed!');
+                    });
+                });
+            }
+        });
+    </script>
 </body>
 </html>
