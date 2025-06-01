@@ -25,7 +25,7 @@ type GeneratorSettings struct {
 	ClientConfigOverrides config.ClientSettings
 	ServerConfigOverrides config.ServerSettings
 	GoExecutablePath      string // Path to the go executable
-	TemplatesBasePath     string // Base path where 'client_template' & 'server_template' dirs reside directly (e.g., .../temp_module/generator/templates)
+	TemplatesBasePath     string // Base path where 'client_template' & 'server_template' dirs reside directly
 	TempModuleRootPath    string // Path to the root of the temporary module (for 'go mod tidy')
 	ProgressCallback      func(message string, percentage int)
 }
@@ -60,7 +60,8 @@ Instructions:
    - Server Web UI Listen Address: {{.ServerConfig.WebUIListenAddress}}
    - Access Web UI at: http://{{.WebUIAccessAddress}}/logs
    - Server Bootstrap Addresses: {{range .ServerConfig.BootstrapAddresses}}{{.}} {{end}}
-   - Server Log File: {{.ServerConfig.InternalLogFileDir}}/{{.ServerConfig.InternalLogFileName}} (Level: {{.ServerConfig.InternalLogLevel}})
+   - Server Diagnostic Log File: {{.ServerConfig.InternalLogFileDir}}/{{.ServerConfig.InternalLogFileName}} (Level: {{.ServerConfig.InternalLogLevel}})
+     (Rotation: MaxSize={{.ServerConfigMaxDiagnosticLogSizeMBOrDefault}}MB, Backups={{.ServerConfigMaxDiagnosticLogBackupsOrDefault}}, MaxAge={{.ServerConfigMaxDiagnosticLogAgeDaysOrDefault}}days)
 
 2. Activity Monitor Client (For Distribution to Target Machines):
    - The 'ActivityMonitorClient_Package' directory contains the client application.
@@ -68,7 +69,11 @@ Instructions:
    - Run '{{.ClientExeName}}' on the target machine(s).
    - It is configured to connect to Server Peer ID: {{.Generated.ServerPeerID}}
    - It will use these bootstrap multiaddresses: {{range .ClientConfig.BootstrapAddresses}}{{.}} {{end}}
-   - Client Log File: {{.ClientConfig.InternalLogFileDir}}/{{.ClientConfig.InternalLogFileName}} (Level: {{.ClientConfig.InternalLogLevel}})
+   - Client Diagnostic Log File: {{.ClientConfig.InternalLogFileDir}}/{{.ClientConfig.InternalLogFileName}} (Level: {{.ClientConfig.InternalLogLevel}})
+     (Rotation: MaxSize={{.ClientConfigMaxLogFileSizeMBOrDefault}}MB, Backups={{.ClientConfigMaxDiagnosticLogBackupsOrDefault}}, MaxAge={{.ClientConfigMaxDiagnosticLogAgeDaysOrDefault}}days)
+   - Client Local Cache DB (SQLite): {{.ClientConfig.LogFilePath}} 
+     (This SQLite DB is also size-managed based on the MaxLogFileSizeMB setting, aiming for ~{{.ClientConfigMaxLogFileSizeMBOrDefault}}MB before aggressive pruning)
+
 
 Security Considerations:
 - The app-level encryption key is vital for data confidentiality. Keep it secure.
@@ -87,9 +92,9 @@ const (
 	CfgSyncIntervalSecs                   = {{.SyncIntervalSecs}}
 	CfgProcessorPeriodicFlushIntervalSecs = {{.ProcessorPeriodicFlushIntervalSecs}}
 	CfgInternalLogLevel                   = "{{.InternalLogLevel}}"
-	CfgLogFilePath                        = ` + "`{{.LogFilePath}}`" + ` 
+	CfgLogFilePath                        = ` + "`{{.LogFilePath}}`" + ` // Path for SQLite DB
 	CfgAppNameForAutorun                  = "{{.AppNameForAutorun}}"
-	CfgLocalLogCacheRetentionDays         = {{.LocalLogCacheRetentionDays}}
+	CfgLocalLogCacheRetentionDays         = {{.LocalLogCacheRetentionDays}} // For SQLite DB
 	CfgRetryIntervalOnFailSecs            = {{.RetryIntervalOnFailSecs}}
 	CfgMaxRetriesPerBatch                 = {{.MaxRetriesPerBatch}}
 	CfgMaxEventsPerSyncBatch              = {{.MaxEventsPerSyncBatch}}
@@ -101,11 +106,31 @@ var CfgBootstrapAddresses = []string{
 {{range .BootstrapAddresses}}	` + "`{{.}}`," + `
 {{end}}}
 
+// CfgMaxLogFileSizeMB is used by the SQLite DB size checker.
+// It shares its value source with CfgDiagnosticLogMaxSizeMB from the ClientSettings (generator configuration).
 {{if .MaxLogFileSizeMBIsSet}}
 var CfgMaxLogFileSizeMBValue = uint64({{.MaxLogFileSizeMBValue}})
-var CfgMaxLogFileSizeMB = &CfgMaxLogFileSizeMBValue
+var CfgMaxLogFileSizeMB = &CfgMaxLogFileSizeMBValue 
 {{else}}
-var CfgMaxLogFileSizeMB *uint64 = nil
+var CfgMaxLogFileSizeMB *uint64 = nil // SQLite DB size check will be disabled if nil
+{{end}}
+
+// For diagnostic text log rotation (using lumberjack)
+// CfgDiagnosticLogMaxSizeMB uses the value from ClientSettings.MaxLogFileSizeMB
+{{if .MaxDiagnosticLogSizeMBIsSet}}
+const CfgDiagnosticLogMaxSizeMB = {{.MaxDiagnosticLogSizeMBValue}} // in MB
+{{else}}
+const CfgDiagnosticLogMaxSizeMB = 10 // Default if not set from ClientSettings
+{{end}}
+{{if .MaxDiagnosticLogBackupsIsSet}}
+const CfgDiagnosticLogMaxBackups = {{.MaxDiagnosticLogBackupsValue}}
+{{else}}
+const CfgDiagnosticLogMaxBackups = 3 // Default if not set from ClientSettings
+{{end}}
+{{if .MaxDiagnosticLogAgeDaysIsSet}}
+const CfgDiagnosticLogMaxAgeDays = {{.MaxDiagnosticLogAgeDaysValue}} // in days
+{{else}}
+const CfgDiagnosticLogMaxAgeDays = 7 // Default if not set from ClientSettings
 {{end}}
 `
 
@@ -128,6 +153,23 @@ const (
 var CfgBootstrapAddresses = []string{
 {{range .BootstrapAddresses}}	` + "`{{.}}`," + `
 {{end}}}
+
+// For diagnostic text log rotation (using lumberjack)
+{{if .MaxDiagnosticLogSizeMBIsSet}}
+const CfgDiagnosticLogMaxSizeMB = {{.MaxDiagnosticLogSizeMBValue}} // in MB
+{{else}}
+const CfgDiagnosticLogMaxSizeMB = 20 // Default if not set from ServerSettings
+{{end}}
+{{if .MaxDiagnosticLogBackupsIsSet}}
+const CfgDiagnosticLogMaxBackups = {{.MaxDiagnosticLogBackupsValue}}
+{{else}}
+const CfgDiagnosticLogMaxBackups = 5 // Default if not set from ServerSettings
+{{end}}
+{{if .MaxDiagnosticLogAgeDaysIsSet}}
+const CfgDiagnosticLogMaxAgeDays = {{.MaxDiagnosticLogAgeDaysValue}} // in days
+{{else}}
+const CfgDiagnosticLogMaxAgeDays = 14 // Default if not set from ServerSettings
+{{end}}
 `
 
 func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
@@ -147,10 +189,10 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 	if genSettings.GoExecutablePath == "" {
 		log.Println("[core] WARNING: GoExecutablePath is empty. Compilation will use 'go' from PATH or fail.")
 	}
-	if genSettings.TemplatesBasePath == "" { // e.g., .../temp_module/generator/templates
+	if genSettings.TemplatesBasePath == "" {
 		return genInfo, fmt.Errorf("templates base path not provided (TemplatesBasePath is empty)")
 	}
-	if genSettings.TempModuleRootPath == "" { // e.g., .../temp_module
+	if genSettings.TempModuleRootPath == "" {
 		return genInfo, fmt.Errorf("temporary module root path not provided (TempModuleRootPath is empty)")
 	}
 
@@ -191,6 +233,7 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 	log.Printf("[core] Generated Server Peer ID: %s", genInfo.ServerPeerID)
 
 	clientCfgValues := config.DefaultClientSettings()
+	// TODO: Apply genSettings.ClientConfigOverrides here if provided
 	clientCfgValues.ClientID = genInfo.AppClientID
 	clientCfgValues.EncryptionKeyHex = genInfo.AppEncryptionKeyHex
 	clientCfgValues.ServerPeerID = genInfo.ServerPeerID
@@ -204,9 +247,20 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 			}
 		}
 	}
+	// If overrides are provided, apply them (example for one field)
+	if genSettings.ClientConfigOverrides.MaxLogFileSizeMB != nil {
+		clientCfgValues.MaxLogFileSizeMB = genSettings.ClientConfigOverrides.MaxLogFileSizeMB
+	}
+	if genSettings.ClientConfigOverrides.MaxDiagnosticLogBackups != nil {
+		clientCfgValues.MaxDiagnosticLogBackups = genSettings.ClientConfigOverrides.MaxDiagnosticLogBackups
+	}
+	if genSettings.ClientConfigOverrides.MaxDiagnosticLogAgeDays != nil {
+		clientCfgValues.MaxDiagnosticLogAgeDays = genSettings.ClientConfigOverrides.MaxDiagnosticLogAgeDays
+	}
 	genSettings.ProgressCallback("Client configuration values prepared.", 20)
 
 	serverCfgValues := config.DefaultServerSettings()
+	// TODO: Apply genSettings.ServerConfigOverrides here if provided
 	serverCfgValues.EncryptionKeyHex = genInfo.AppEncryptionKeyHex
 	serverCfgValues.ServerIdentityKeySeedHex = genInfo.ServerIdentitySeedHex
 	if len(clientCfgValues.BootstrapAddresses) > 0 {
@@ -215,10 +269,18 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 	} else {
 		serverCfgValues.BootstrapAddresses = []string{}
 	}
+	// Apply overrides for server diagnostic logs
+	if genSettings.ServerConfigOverrides.MaxDiagnosticLogSizeMB != nil {
+		serverCfgValues.MaxDiagnosticLogSizeMB = genSettings.ServerConfigOverrides.MaxDiagnosticLogSizeMB
+	}
+	if genSettings.ServerConfigOverrides.MaxDiagnosticLogBackups != nil {
+		serverCfgValues.MaxDiagnosticLogBackups = genSettings.ServerConfigOverrides.MaxDiagnosticLogBackups
+	}
+	if genSettings.ServerConfigOverrides.MaxDiagnosticLogAgeDays != nil {
+		serverCfgValues.MaxDiagnosticLogAgeDays = genSettings.ServerConfigOverrides.MaxDiagnosticLogAgeDays
+	}
 	genSettings.ProgressCallback("Server configuration values prepared.", 25)
 
-	// TemplatesBasePath is e.g. .../temp_module_root/generator/templates
-	// clientSrcPath becomes .../temp_module_root/generator/templates/client_template
 	clientSrcPath := filepath.Join(genSettings.TemplatesBasePath, "client_template")
 	serverSrcPath := filepath.Join(genSettings.TemplatesBasePath, "server_template")
 
@@ -253,12 +315,31 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 
 	clientTemplateData := struct {
 		config.ClientSettings
-		MaxLogFileSizeMBIsSet bool
-		MaxLogFileSizeMBValue uint64
+		MaxLogFileSizeMBIsSet        bool
+		MaxLogFileSizeMBValue        uint64
+		MaxDiagnosticLogSizeMBIsSet  bool
+		MaxDiagnosticLogSizeMBValue  uint64
+		MaxDiagnosticLogBackupsIsSet bool
+		MaxDiagnosticLogBackupsValue int
+		MaxDiagnosticLogAgeDaysIsSet bool
+		MaxDiagnosticLogAgeDaysValue int
 	}{ClientSettings: clientCfgValues}
+
 	if clientCfgValues.MaxLogFileSizeMB != nil {
 		clientTemplateData.MaxLogFileSizeMBIsSet = true
 		clientTemplateData.MaxLogFileSizeMBValue = *clientCfgValues.MaxLogFileSizeMB
+	}
+	if clientCfgValues.MaxLogFileSizeMB != nil { // Re-using for diagnostic log size
+		clientTemplateData.MaxDiagnosticLogSizeMBIsSet = true
+		clientTemplateData.MaxDiagnosticLogSizeMBValue = *clientCfgValues.MaxLogFileSizeMB
+	}
+	if clientCfgValues.MaxDiagnosticLogBackups != nil {
+		clientTemplateData.MaxDiagnosticLogBackupsIsSet = true
+		clientTemplateData.MaxDiagnosticLogBackupsValue = *clientCfgValues.MaxDiagnosticLogBackups
+	}
+	if clientCfgValues.MaxDiagnosticLogAgeDays != nil {
+		clientTemplateData.MaxDiagnosticLogAgeDaysIsSet = true
+		clientTemplateData.MaxDiagnosticLogAgeDaysValue = *clientCfgValues.MaxDiagnosticLogAgeDays
 	}
 
 	clientGeneratedGoPath := filepath.Join(clientSrcPath, "config_generated.go")
@@ -268,8 +349,31 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 	genSettings.ProgressCallback("Client Go config file generated.", 35)
 	log.Printf("[core] Wrote client config to: %s", clientGeneratedGoPath)
 
+	serverTemplateData := struct {
+		config.ServerSettings
+		MaxDiagnosticLogSizeMBIsSet  bool
+		MaxDiagnosticLogSizeMBValue  uint64
+		MaxDiagnosticLogBackupsIsSet bool
+		MaxDiagnosticLogBackupsValue int
+		MaxDiagnosticLogAgeDaysIsSet bool
+		MaxDiagnosticLogAgeDaysValue int
+	}{ServerSettings: serverCfgValues}
+
+	if serverCfgValues.MaxDiagnosticLogSizeMB != nil {
+		serverTemplateData.MaxDiagnosticLogSizeMBIsSet = true
+		serverTemplateData.MaxDiagnosticLogSizeMBValue = *serverCfgValues.MaxDiagnosticLogSizeMB
+	}
+	if serverCfgValues.MaxDiagnosticLogBackups != nil {
+		serverTemplateData.MaxDiagnosticLogBackupsIsSet = true
+		serverTemplateData.MaxDiagnosticLogBackupsValue = *serverCfgValues.MaxDiagnosticLogBackups
+	}
+	if serverCfgValues.MaxDiagnosticLogAgeDays != nil {
+		serverTemplateData.MaxDiagnosticLogAgeDaysIsSet = true
+		serverTemplateData.MaxDiagnosticLogAgeDaysValue = *serverCfgValues.MaxDiagnosticLogAgeDays
+	}
+
 	serverGeneratedGoPath := filepath.Join(serverSrcPath, "config_generated.go")
-	if err := writeGoConfig(serverGeneratedGoPath, serverGeneratedConfigTemplate, serverCfgValues); err != nil {
+	if err := writeGoConfig(serverGeneratedGoPath, serverGeneratedConfigTemplate, serverTemplateData); err != nil {
 		return genInfo, fmt.Errorf("failed to write server_generated_config.go: %w", err)
 	}
 	genSettings.ProgressCallback("Server Go config file generated.", 40)
@@ -290,7 +394,6 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 	clientOutPath := filepath.Join(clientPackagePath, clientExeName)
 	serverOutPath := filepath.Join(serverPackagePath, serverExeName)
 
-	// Run 'go mod tidy' in the root of the temporary module.
 	genSettings.ProgressCallback("Ensuring module dependencies (go mod tidy)...", 42)
 	if err := runGoModTidy(genSettings.TempModuleRootPath, genSettings.GoExecutablePath); err != nil {
 		return genInfo, fmt.Errorf("failed to run 'go mod tidy': %w", err)
@@ -326,22 +429,35 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 	genSettings.ProgressCallback("Server UI assets copied.", 85)
 
 	readmeData := struct {
-		Timestamp          string
-		Generated          GeneratedInfo
-		ClientConfig       config.ClientSettings
-		ServerConfig       config.ServerSettings
-		ClientExeName      string
-		ServerExeName      string
-		WebUIAccessAddress string
+		Timestamp                                    string
+		Generated                                    GeneratedInfo
+		ClientConfig                                 config.ClientSettings
+		ServerConfig                                 config.ServerSettings
+		ClientExeName                                string
+		ServerExeName                                string
+		WebUIAccessAddress                           string
+		ClientConfigMaxLogFileSizeMBOrDefault        uint64
+		ClientConfigMaxDiagnosticLogBackupsOrDefault int
+		ClientConfigMaxDiagnosticLogAgeDaysOrDefault int
+		ServerConfigMaxDiagnosticLogSizeMBOrDefault  uint64
+		ServerConfigMaxDiagnosticLogBackupsOrDefault int
+		ServerConfigMaxDiagnosticLogAgeDaysOrDefault int
 	}{
-		Timestamp:          time.Now().Format(time.RFC1123),
-		Generated:          genInfo,
-		ClientConfig:       clientCfgValues,
-		ServerConfig:       serverCfgValues,
-		ClientExeName:      clientExeName,
-		ServerExeName:      serverExeName,
-		WebUIAccessAddress: strings.Replace(serverCfgValues.WebUIListenAddress, "0.0.0.0", "127.0.0.1", 1),
+		Timestamp:                             time.Now().Format(time.RFC1123),
+		Generated:                             genInfo,
+		ClientConfig:                          clientCfgValues, // Pass the struct itself
+		ServerConfig:                          serverCfgValues, // Pass the struct itself
+		ClientExeName:                         clientExeName,
+		ServerExeName:                         serverExeName,
+		WebUIAccessAddress:                    strings.Replace(serverCfgValues.WebUIListenAddress, "0.0.0.0", "127.0.0.1", 1),
+		ClientConfigMaxLogFileSizeMBOrDefault: clientCfgValues.GetMaxLogFileSizeMBOrDefault(),
+		ClientConfigMaxDiagnosticLogBackupsOrDefault: clientCfgValues.GetMaxDiagnosticLogBackupsOrDefault(),
+		ClientConfigMaxDiagnosticLogAgeDaysOrDefault: clientCfgValues.GetMaxDiagnosticLogAgeDaysOrDefault(),
+		ServerConfigMaxDiagnosticLogSizeMBOrDefault:  serverCfgValues.GetMaxDiagnosticLogSizeMBOrDefault(),
+		ServerConfigMaxDiagnosticLogBackupsOrDefault: serverCfgValues.GetMaxDiagnosticLogBackupsOrDefault(),
+		ServerConfigMaxDiagnosticLogAgeDaysOrDefault: serverCfgValues.GetMaxDiagnosticLogAgeDaysOrDefault(),
 	}
+
 	tmplReadme, err := template.New("readme").Parse(readmeTemplate)
 	if err != nil {
 		return genInfo, fmt.Errorf("failed to parse README template: %w", err)
@@ -441,12 +557,12 @@ func compileGoTemplate(srcDir, outputPath string, clientStealth bool, goExecutab
 	if clientStealth {
 		ldflags = append(ldflags, "-H=windowsgui")
 	}
-	ldflags = append(ldflags, "-s", "-w") // Add stripping flags
+	ldflags = append(ldflags, "-s", "-w")
 
 	if len(ldflags) > 0 {
 		args = append(args, "-ldflags="+strings.Join(ldflags, " "))
 	}
-	args = append(args, ".") // Build the package in the current directory (srcDir)
+	args = append(args, ".")
 
 	cmd := exec.Command(effectiveGoExecutable, args...)
 	cmd.Dir = srcDir

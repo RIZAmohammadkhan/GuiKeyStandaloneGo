@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"gopkg.in/natefinch/lumberjack.v2"
 	_ "modernc.org/sqlite" // Pure Go SQLite driver
 )
 
@@ -43,12 +44,21 @@ func setupServerLogger() {
 	}
 
 	logPath := filepath.Join(absLogDir, logFileName)
-	file, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		log.Fatalf("SERVER CRITICAL: Failed to open server log file %s: %v", logPath, err)
+
+	// Configure lumberjack for diagnostic log rotation
+	ljLogger := &lumberjack.Logger{
+		Filename:   logPath,
+		MaxSize:    int(CfgDiagnosticLogMaxSizeMB), // From generated config
+		MaxBackups: CfgDiagnosticLogMaxBackups,     // From generated config
+		MaxAge:     CfgDiagnosticLogMaxAgeDays,     // From generated config
+		Compress:   false,
+		LocalTime:  true,
 	}
-	serverGlobalLogger = log.New(file, "SERVER: ", log.LstdFlags|log.Lshortfile)
-	serverGlobalLogger.Printf("Server logger initialized (Level: %s). Log file: %s", CfgInternalLogLevel, logPath)
+	serverGlobalLogger = log.New(ljLogger, "SERVER: ", log.LstdFlags|log.Lshortfile)
+	serverGlobalLogger.Printf(
+		"Server diagnostic logger initialized (Level: %s). Log file: %s, MaxSizeMB: %d, MaxBackups: %d, MaxAgeDays: %d",
+		CfgInternalLogLevel, logPath, CfgDiagnosticLogMaxSizeMB, CfgDiagnosticLogMaxBackups, CfgDiagnosticLogMaxAgeDays,
+	)
 }
 
 func main() {
@@ -58,7 +68,7 @@ func main() {
 	serverGlobalLogger.Printf("P2P Listen Address: %s", CfgP2PListenAddress)
 	serverGlobalLogger.Printf("Web UI Listen Address: %s", CfgWebUIListenAddress)
 	serverGlobalLogger.Printf("Database Path: %s", CfgDatabasePath)
-	serverGlobalLogger.Printf("Log Retention Days: %d", CfgLogRetentionDays)
+	serverGlobalLogger.Printf("Log Retention Days (for DB): %d", CfgLogRetentionDays)
 	serverGlobalLogger.Printf("Server Bootstrap Addresses: %v", CfgBootstrapAddresses)
 
 	dbPathServer := CfgDatabasePath
@@ -110,7 +120,7 @@ func main() {
 	pruneInterval := time.Duration(CfgLogDeletionCheckIntervalHrs) * time.Hour
 	if CfgLogDeletionCheckIntervalHrs == 0 {
 		pruneInterval = 24 * 365 * time.Hour
-		serverGlobalLogger.Println("Server LogStore pruning disabled (interval is 0).")
+		serverGlobalLogger.Println("Server LogStore DB pruning disabled (interval is 0).")
 	}
 	go runServerLogStoreManager(serverLogStore, internalQuitChan, &wg, CfgLogRetentionDays, pruneInterval)
 
