@@ -1,5 +1,5 @@
 // File: GuiKeyStandaloneGo/gui_generator_app/resources.go
-package main
+package main // Important: This is part of package main
 
 import (
 	"archive/zip"
@@ -15,6 +15,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -24,12 +25,13 @@ import (
 //go:embed all:embedded_go_sdk
 var embeddedGoSDKFS embed.FS
 
-const embeddedGoSDKZipName = "go1.24.3.windows-amd64.zip"
+// NOTE: Ensure these constants match EXACTLY what's in your embedded_go_sdk directory
+const embeddedGoSDKZipName = "go1.24.3.windows-amd64.zip" // Example: UPDATE THIS
 const embeddedGoSDKZipPath = "embedded_go_sdk/" + embeddedGoSDKZipName
-const embeddedGoSDKSHA256 = "be9787cb08998b1860fe3513e48a5fe5b96302d358a321b58e651184fa9638b3"
+const embeddedGoSDKSHA256 = "be9787cb08998b1860fe3513e48a5fe5b96302d358a321b58e651184fa9638b3" // Example: UPDATE THIS
 
 // --- Source Code Embedding ---
-//
+
 //go:embed all:generator/templates/client_template
 var embeddedClientTemplateFS embed.FS
 
@@ -60,6 +62,8 @@ var embeddedPkgTypesFS embed.FS
 
 const pkgTypesEmbedRelPath = "pkg/types"
 
+// Module path for the generator app itself, used in generated go.mod files for 'replace' directives.
+// This should match the module path defined in GuiKeyStandaloneGo/gui_generator_app/go.mod
 const mainAppModulePath = "github.com/RIZAmohammadkhan/GuiKeyStandaloneGo/gui_generator_app"
 
 var (
@@ -76,14 +80,8 @@ var (
 
 type ProgressFunc func(message string, percentage int)
 
-// progressMessageMaxDisplayLength is the target maximum length for messages passed to ProgressFunc.
-// This helps keep progress updates concise for display in UIs or logs.
-// Adjusted for typical log prefixes like "[TAG] XX%: " on an 80-char line, leaving ~55 chars for the message itself.
 const progressMessageMaxDisplayLength = 55
 
-// truncateString shortens a string to a maximum length, appending "..." if truncation occurs
-// and if maxLength allows for it (>=3 characters). If maxLength is too small for "...",
-// it truncates to maxLength characters. If maxLength <= 0, returns an empty string.
 func truncateString(s string, maxLength int) string {
 	if maxLength <= 0 {
 		return ""
@@ -91,52 +89,32 @@ func truncateString(s string, maxLength int) string {
 	if len(s) <= maxLength {
 		return s
 	}
-	if maxLength < 3 { // Not enough space for "..."
+	if maxLength < 3 {
 		return s[:maxLength]
 	}
 	return s[:maxLength-3] + "..."
 }
 
-// formatProgressMessage formats a message string that has a single dynamic argument (%s).
-// It ensures the total length of the resulting string attempts to stay within maxTotalLen.
-// It prioritizes showing static parts of the format string and truncates dynamicArg to fit.
-// If static parts alone exceed maxTotalLen, the entire formatted string will be truncated.
-// Assumes 'format' contains exactly one '%s' placeholder for dynamicArg.
 func formatProgressMessage(format string, dynamicArg string, maxTotalLen int) string {
 	staticLen := 0
-	// Ensure format string actually contains "%s"
 	parts := strings.SplitN(format, "%s", 2)
-	if len(parts) < 2 { // %s not found in format
-		log.Printf("[WARN] formatProgressMessage used with format string lacking %%s: '%s'", format)
-		// Treat format as fully static, dynamicArg is ignored.
+	if len(parts) < 2 {
+		log.Printf("[WARN] formatProgressMessage: format string lacks '%%s': '%s'", format)
 		return truncateString(format, maxTotalLen)
 	}
-	staticLen += len(parts[0])
-	staticLen += len(parts[1]) // parts[1] is empty if %s is at the end of the format string
-
+	staticLen += len(parts[0]) + len(parts[1])
 	availableForDynamic := maxTotalLen - staticLen
-	// truncateString handles non-positive availableForDynamic correctly (e.g., returns "" or clips)
-
 	truncatedDynamicArg := truncateString(dynamicArg, availableForDynamic)
-
 	finalMessage := fmt.Sprintf(format, truncatedDynamicArg)
-
-	// Final check: if static parts were too long, Sprintf added unexpected length,
-	// or availableForDynamic was negative, ensure the final message respects maxTotalLen.
 	if len(finalMessage) > maxTotalLen {
 		return truncateString(finalMessage, maxTotalLen)
 	}
-
 	return finalMessage
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
+// GetGoExecutablePath extracts the embedded Go SDK if not already done,
+// and returns the path to the go.exe and a cleanup function.
+// It is thread-safe due to sync.Once.
 func GetGoExecutablePath(ctx context.Context, progress ProgressFunc) (exePath string, cleanupFunc func() error, err error) {
 	extractedGoPathOnce.Do(func() {
 		log.Println("[res-go] First call to GetGoExecutablePath, proceeding with extraction.")
@@ -154,7 +132,7 @@ func GetGoExecutablePath(ctx context.Context, progress ProgressFunc) (exePath st
 
 		progress("Verifying Go SDK checksum...", 5)
 		hasher := sha256.New()
-		hasher.Write(zipBytes)
+		hasher.Write(zipBytes) // Best to write in chunks if SDK is huge, but for typical sizes this is fine.
 		actualSHA := hex.EncodeToString(hasher.Sum(nil))
 		if actualSHA != embeddedGoSDKSHA256 {
 			extractedGoPathErr = fmt.Errorf("Go SDK checksum MISMATCH! Expected: %s, Got: %s for %s", embeddedGoSDKSHA256, actualSHA, embeddedGoSDKZipName)
@@ -209,7 +187,12 @@ func GetGoExecutablePath(ctx context.Context, progress ProgressFunc) (exePath st
 			}
 
 			if f.FileInfo().IsDir() {
-				os.MkdirAll(fpath, os.ModePerm)
+				if err := os.MkdirAll(fpath, os.ModePerm); err != nil {
+					extractedGoPathErr = fmt.Errorf("creating directory structure %s: %w", fpath, err)
+					progressMsg := formatProgressMessage("Error creating dir %s", filepath.Base(f.Name), progressMessageMaxDisplayLength)
+					progress(progressMsg, 100)
+					return
+				}
 				continue
 			}
 
@@ -222,7 +205,7 @@ func GetGoExecutablePath(ctx context.Context, progress ProgressFunc) (exePath st
 
 			outFile, errOpen := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
 			if errOpen != nil {
-				extractedGoPathErr = fmt.Errorf("opening %s: %w", fpath, errOpen)
+				extractedGoPathErr = fmt.Errorf("opening %s for writing: %w", fpath, errOpen)
 				progressMsg := formatProgressMessage("Error opening file %s for writing", filepath.Base(f.Name), progressMessageMaxDisplayLength)
 				progress(progressMsg, 100)
 				return
@@ -238,24 +221,32 @@ func GetGoExecutablePath(ctx context.Context, progress ProgressFunc) (exePath st
 			}
 
 			_, errCopy := io.Copy(outFile, rc)
-			outFile.Close()
-			rc.Close()
+			// Close both files regardless of copy error, but after checking the error.
+			closeErrOut := outFile.Close()
+			closeErrIn := rc.Close()
+
 			if errCopy != nil {
 				extractedGoPathErr = fmt.Errorf("copying %s: %w", f.Name, errCopy)
 				progressMsg := formatProgressMessage("Error copying file %s", f.Name, progressMessageMaxDisplayLength)
 				progress(progressMsg, 100)
 				return
 			}
+			if closeErrOut != nil {
+				log.Printf("[res-go] Warning: error closing output file %s: %v", fpath, closeErrOut)
+			}
+			if closeErrIn != nil {
+				log.Printf("[res-go] Warning: error closing input stream for %s from zip: %v", f.Name, closeErrIn)
+			}
 
 			filesExtracted++
-			currentProgress := 15 + int(float64(filesExtracted)*80.0/float64(totalFiles))
+			currentProgress := 15 + int(float64(filesExtracted)*80.0/float64(totalFiles)) // 15% to 95% for extraction
 			progressMsg := formatProgressMessage("Extracting Go SDK: %s", filepath.Base(f.Name), progressMessageMaxDisplayLength)
 			progress(progressMsg, currentProgress)
 		}
 
 		exePathTemp := filepath.Join(tempDir, "go", "bin", "go.exe")
 		if _, errStat := os.Stat(exePathTemp); os.IsNotExist(errStat) {
-			extractedGoPathErr = fmt.Errorf("go.exe not found at expected path %s after extraction. Check embedded zip structure", exePathTemp)
+			extractedGoPathErr = fmt.Errorf("go.exe not found at expected path %s after extraction. Check embedded zip structure and `embeddedGoSDKZipName`", exePathTemp)
 			progress("go.exe not found post-extraction.", 100)
 			return
 		}
@@ -263,124 +254,18 @@ func GetGoExecutablePath(ctx context.Context, progress ProgressFunc) (exePath st
 		progress("Go environment ready.", 100)
 		log.Printf("[res-go] Extracted Go executable: %s", extractedGoPath)
 	})
-
 	return extractedGoPath, extractedGoCleanupFunc, extractedGoPathErr
 }
 
-func extractFSDirContents(ctx context.Context, embedFS embed.FS, srcRootInEmbedFS string, destDiskDir string, extractionName string, progressSubOp ProgressFunc) error {
-	log.Printf("[extractFS-%s] Extracting from embedFS (src root in embed: '%s') to disk dir '%s'", extractionName, srcRootInEmbedFS, destDiskDir)
-
-	if err := os.MkdirAll(destDiskDir, 0755); err != nil {
-		return fmt.Errorf("creating base destination directory '%s' for %s: %w", destDiskDir, extractionName, err)
-	}
-
-	var filesProcessed uint64
-	var totalFilesToProcess uint64
-
-	fs.WalkDir(embedFS, srcRootInEmbedFS, func(path string, d fs.DirEntry, errIn error) error {
-		if errIn != nil {
-			log.Printf("[extractFS-%s] Warning: error accessing path '%s' during count: %v", extractionName, path, errIn)
-			return fs.SkipDir
-		}
-		if !d.IsDir() {
-			totalFilesToProcess++
-		}
-		return nil
-	})
-
-	if totalFilesToProcess == 0 {
-		log.Printf("[extractFS-%s] No files to extract from embedFS (src root in embed: '%s').", extractionName, srcRootInEmbedFS)
-		if progressSubOp != nil {
-			// Message is short, direct call is fine.
-			progressSubOp(fmt.Sprintf("No files in %s.", extractionName), 100)
-		}
-		return nil
-	}
-	log.Printf("[extractFS-%s] Total files to extract: %d", extractionName, totalFilesToProcess)
-
-	return fs.WalkDir(embedFS, srcRootInEmbedFS, func(pathInEmbed string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			log.Printf("[extractFS-%s] Error walking at '%s': %v", extractionName, pathInEmbed, walkErr)
-			return walkErr
-		}
-
-		select {
-		case <-ctx.Done():
-			log.Printf("[extractFS-%s] Extraction cancelled via context for path %s", extractionName, pathInEmbed)
-			return ctx.Err()
-		default:
-		}
-
-		relativePath, errRel := filepath.Rel(srcRootInEmbedFS, pathInEmbed)
-		if errRel != nil {
-			return fmt.Errorf("calculating relative path for '%s' from '%s' in %s: %w", pathInEmbed, srcRootInEmbedFS, extractionName, errRel)
-		}
-		if relativePath == "." {
-			return nil
-		}
-
-		destPathOnDisk := filepath.Join(destDiskDir, relativePath)
-
-		if d.IsDir() {
-			if errMk := os.MkdirAll(destPathOnDisk, 0755); errMk != nil {
-				return fmt.Errorf("creating directory '%s' for %s: %w", destPathOnDisk, extractionName, errMk)
-			}
-			return nil
-		}
-
-		if errMkParent := os.MkdirAll(filepath.Dir(destPathOnDisk), 0755); errMkParent != nil {
-			return fmt.Errorf("creating parent directory for file '%s' for %s: %w", destPathOnDisk, extractionName, errMkParent)
-		}
-
-		fileData, readErr := embedFS.ReadFile(pathInEmbed)
-		if readErr != nil {
-			return fmt.Errorf("reading embedded %s file '%s': %w", extractionName, pathInEmbed, readErr)
-		}
-
-		if errWrite := os.WriteFile(destPathOnDisk, fileData, 0644); errWrite != nil {
-			return fmt.Errorf("writing %s file '%s' to disk: %w", extractionName, destPathOnDisk, errWrite)
-		}
-
-		filesProcessed++
-		if progressSubOp != nil {
-			percent := 0
-			if totalFilesToProcess > 0 {
-				percent = int(float64(filesProcessed) * 100.0 / float64(totalFilesToProcess))
-			}
-
-			// Custom handling for "Extracting %s: %s" format
-			// extractionName is e.g., "client templates", "pkg/config" - usually short.
-			// relativePath can be long.
-			firstPart := fmt.Sprintf("Extracting %s: ", extractionName)
-
-			availableForRelativePath := progressMessageMaxDisplayLength - len(firstPart)
-			// Ensure availableForRelativePath is not excessively small if firstPart is unexpectedly long
-			if availableForRelativePath < 0 { // Should ideally not happen with known extractionNames
-				availableForRelativePath = 0
-			}
-			truncatedRelativePath := truncateString(relativePath, availableForRelativePath)
-
-			message := firstPart + truncatedRelativePath
-
-			// Final safety truncate, in case firstPart was already too long (unlikely for known extractionNames)
-			// or if Sprintf added unexpected length.
-			if len(message) > progressMessageMaxDisplayLength {
-				message = truncateString(message, progressMessageMaxDisplayLength)
-			}
-
-			progressSubOp(message, percent)
-		}
-		return nil
-	})
-}
-
+// GetTemporaryModulePath extracts embedded source templates and shared packages
+// into a temporary directory structure suitable for `go build`.
+// It is thread-safe due to sync.Once.
 func GetTemporaryModulePath(ctx context.Context, progress ProgressFunc) (moduleRootPath string, cleanupFunc func() error, err error) {
 	temporaryModuleRootPathOnce.Do(func() {
 		log.Println("[res-mod] First call to GetTemporaryModulePath, setting up temp module.")
 		if progress == nil {
 			progress = func(m string, p int) { log.Printf("[res-mod-progress] %d%%: %s", p, m) }
 		}
-		// Static progress messages are generally short and don't need truncation.
 		progress("Preparing temporary Go module structure...", 0)
 
 		tempModuleRoot, mkErr := os.MkdirTemp("", "guikey-temp-module-")
@@ -395,48 +280,63 @@ func GetTemporaryModulePath(ctx context.Context, progress ProgressFunc) (moduleR
 			return os.RemoveAll(tempModuleRoot)
 		}
 
-		var goVersionForMod = "1.24.3"
-		if strings.HasPrefix(embeddedGoSDKZipName, "go") && strings.Contains(embeddedGoSDKZipName, ".windows-amd64.zip") {
-			versionPart := strings.TrimPrefix(embeddedGoSDKZipName, "go")
-			versionPart = strings.TrimSuffix(versionPart, ".windows-amd64.zip")
-			if len(versionPart) > 0 && strings.Count(versionPart, ".") >= 1 {
-				goVersionForMod = versionPart
-			} else {
-				log.Printf("[res-mod] Could not parse Go version from SDK name '%s', using default '%s'", embeddedGoSDKZipName, goVersionForMod)
+		// Determine Go version for go.mod from the SDK zip filename
+		goVersionForMod := "1.22" // Fallback Go version
+		if strings.HasPrefix(embeddedGoSDKZipName, "go") {
+			parts := strings.Split(strings.TrimPrefix(embeddedGoSDKZipName, "go"), ".")
+			if len(parts) >= 2 {
+				majorMinor := parts[0] + "." + parts[1]
+				if _, errConv := strconv.Atoi(parts[0]); errConv == nil { // Basic check
+					if _, errConv2 := strconv.Atoi(parts[1]); errConv2 == nil {
+						goVersionForMod = majorMinor
+					}
+				}
 			}
 		}
 		log.Printf("[res-mod] Using Go version '%s' for generated go.mod files.", goVersionForMod)
 
+		// Content for the main temporary module's go.mod
+		// It replaces its own 'pkg' directory to point to the one we are about to extract.
 		tempGoModContent := fmt.Sprintf(`
 module tempbuildmodule
 
 go %s
 
+// These are direct dependencies of client_template and server_template main packages
+// Ensure they match what's actually used.
 require (
 	github.com/google/uuid v1.6.0
-	github.com/libp2p/go-libp2p v0.37.0 
-	github.com/libp2p/go-libp2p-kad-dht v0.28.0 
-	github.com/multiformats/go-multiaddr v0.13.0 
-	golang.org/x/sys v0.26.0 
-	modernc.org/sqlite v1.30.2 
+	github.com/libp2p/go-libp2p v0.37.0
+	github.com/libp2p/go-libp2p-kad-dht v0.28.0
+	github.com/multiformats/go-multiaddr v0.13.0
+	golang.org/x/sys v0.26.0
+	modernc.org/sqlite v1.30.2
+	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // For logging
 )
 
-replace %[2]s/pkg => ./pkg
-`, goVersionForMod, mainAppModulePath)
+// This replace directive is crucial for the build process.
+// It tells the Go compiler that any import of "github.com/RIZAmohammadkhan/GuiKeyStandaloneGo/gui_generator_app/pkg/..."
+// should resolve to the "./pkg" subdirectory within this temporary module.
+replace %s/pkg => ./pkg
+`, goVersionForMod, mainAppModulePath) // mainAppModulePath is the module path of gui_generator_app
 
-		log.Println("[res-mod] Writing generated go.mod to temp module root.")
 		if errWriteMod := os.WriteFile(filepath.Join(tempModuleRoot, "go.mod"), []byte(strings.TrimSpace(tempGoModContent)), 0644); errWriteMod != nil {
-			temporaryModuleRootPathErr = fmt.Errorf("writing generated go.mod: %w", errWriteMod)
+			temporaryModuleRootPathErr = fmt.Errorf("writing main go.mod for temp module: %w", errWriteMod)
 			progress("Error writing temp go.mod.", 100)
 			return
 		}
-		progress("Temporary go.mod created.", 5)
+		progress("Temporary main go.mod created.", 5)
 
+		// --- Extract generator/templates ---
+		// Destination structure: <tempModuleRoot>/generator/templates/client_template
+		//                                                            /server_template
 		overallTemplatesBaseDir := filepath.Join(tempModuleRoot, "generator", "templates")
+
+		// Extract client_template
 		clientTemplatesDestDir := filepath.Join(overallTemplatesBaseDir, "client_template")
-		progress("Extracting client templates...", 5) // Static message
+		progress("Extracting client templates...", 10)
 		errExtractClientTpl := extractFSDirContents(ctx, embeddedClientTemplateFS, clientTemplateEmbedRelPath, clientTemplatesDestDir, "client templates", func(msg string, p int) {
-			progress(msg, 5+int(float64(p)*0.15)) // msg is already truncated by extractFSDirContents
+			progress(msg, 10+int(float64(p)*0.20)) // 20% of total progress for client templates
 		})
 		if errExtractClientTpl != nil {
 			temporaryModuleRootPathErr = fmt.Errorf("extracting client_template: %w", errExtractClientTpl)
@@ -444,12 +344,13 @@ replace %[2]s/pkg => ./pkg
 			return
 		}
 		log.Printf("[res-mod] 'client_template' extracted to: %s", clientTemplatesDestDir)
-		progress("Client templates extracted.", 20)
+		progress("Client templates extracted.", 30)
 
+		// Extract server_template
 		serverTemplatesDestDir := filepath.Join(overallTemplatesBaseDir, "server_template")
-		progress("Extracting server templates...", 20) // Static message
+		progress("Extracting server templates...", 30)
 		errExtractServerTpl := extractFSDirContents(ctx, embeddedServerTemplateFS, serverTemplateEmbedRelPath, serverTemplatesDestDir, "server templates", func(msg string, p int) {
-			progress(msg, 20+int(float64(p)*0.15)) // msg is already truncated by extractFSDirContents
+			progress(msg, 30+int(float64(p)*0.20)) // 20% for server templates
 		})
 		if errExtractServerTpl != nil {
 			temporaryModuleRootPathErr = fmt.Errorf("extracting server_template: %w", errExtractServerTpl)
@@ -457,29 +358,29 @@ replace %[2]s/pkg => ./pkg
 			return
 		}
 		log.Printf("[res-mod] 'server_template' extracted to: %s", serverTemplatesDestDir)
-		progress("Server templates extracted.", 35)
+		progress("Server templates extracted.", 50)
 
+		// --- Extract shared pkg directory ---
+		// Destination structure: <tempModuleRoot>/pkg/config, pkg/crypto, etc.
 		basePkgDestDir := filepath.Join(tempModuleRoot, "pkg")
-
 		pkgSubDirs := []struct {
 			fsVar          embed.FS
 			embedRelPath   string
-			name           string
+			name           string // Name of the sub-package, e.g., "config"
 			progressOffset int
 			progressWeight float64
 		}{
-			{embeddedPkgConfigFS, pkgConfigEmbedRelPath, "config", 35, 0.13},
-			{embeddedPkgCryptoFS, pkgCryptoEmbedRelPath, "crypto", 48, 0.13},
-			{embeddedPkgP2PFS, pkgP2PEmbedRelPath, "p2p", 61, 0.13},
-			{embeddedPkgTypesFS, pkgTypesEmbedRelPath, "types", 74, 0.13},
+			{embeddedPkgConfigFS, pkgConfigEmbedRelPath, "config", 50, 0.10},
+			{embeddedPkgCryptoFS, pkgCryptoEmbedRelPath, "crypto", 60, 0.10},
+			{embeddedPkgP2PFS, pkgP2PEmbedRelPath, "p2p", 70, 0.10},
+			{embeddedPkgTypesFS, pkgTypesEmbedRelPath, "types", 80, 0.10},
 		}
 
 		for _, subDir := range pkgSubDirs {
+			// The destination path for each sub-package is basePkgDestDir + subDir.name
 			destPath := filepath.Join(basePkgDestDir, subDir.name)
-			// Static part of this message is fine.
 			progress(fmt.Sprintf("Extracting pkg/%s...", subDir.name), subDir.progressOffset)
 			errExtract := extractFSDirContents(ctx, subDir.fsVar, subDir.embedRelPath, destPath, "pkg/"+subDir.name, func(msg string, p int) {
-				// msg is already truncated by extractFSDirContents
 				progress(msg, subDir.progressOffset+int(float64(p)*subDir.progressWeight))
 			})
 			if errExtract != nil {
@@ -489,23 +390,30 @@ replace %[2]s/pkg => ./pkg
 			}
 			log.Printf("[res-mod] 'pkg/%s' extracted to: %s", subDir.name, destPath)
 		}
-		progress("All shared packages (pkg) extracted.", 87)
+		progress("All shared packages (pkg) extracted.", 90)
 
+		// Create a go.mod for the 'pkg' directory itself.
+		// This is needed if 'pkg' contains its own sub-packages that import each other,
+		// or if 'go mod tidy' on the root module needs to understand 'pkg' as a module.
+		// The module path for this go.mod should be the one used in the 'replace' directive.
 		pkgGoModContent := fmt.Sprintf(`
 module %s/pkg
 
 go %s
+// No explicit requires here, as this is a library module.
+// Dependencies are managed by the main tempbuildmodule's go.mod.
 `, mainAppModulePath, goVersionForMod)
 
 		pkgGoModPath := filepath.Join(basePkgDestDir, "go.mod")
-		log.Printf("[res-mod] Writing go.mod for the 'pkg' module to: %s", pkgGoModPath)
 		if errWritePkgMod := os.WriteFile(pkgGoModPath, []byte(strings.TrimSpace(pkgGoModContent)), 0644); errWritePkgMod != nil {
 			temporaryModuleRootPathErr = fmt.Errorf("writing pkg/go.mod: %w", errWritePkgMod)
 			progress("Error writing temporary pkg/go.mod.", 100)
 			return
 		}
+		log.Printf("[res-mod] 'pkg/go.mod' created at: %s", pkgGoModPath)
 		progress("Temporary pkg/go.mod created.", 95)
 
+		// Final checks for key files
 		clientMainGoPath := filepath.Join(clientTemplatesDestDir, "main.go")
 		if _, errStat := os.Stat(clientMainGoPath); os.IsNotExist(errStat) {
 			temporaryModuleRootPathErr = fmt.Errorf("post-extraction check: client_template/main.go ('%s') missing", clientMainGoPath)
@@ -522,10 +430,10 @@ go %s
 		}
 		log.Printf("[res-mod-check] Verified existence of: %s", serverMainGoPath)
 
-		pkgConfigFinalPath := filepath.Join(basePkgDestDir, "config")
+		pkgConfigFinalPath := filepath.Join(basePkgDestDir, "config", "models.go") // Check a specific file
 		if _, errStat := os.Stat(pkgConfigFinalPath); os.IsNotExist(errStat) {
-			temporaryModuleRootPathErr = fmt.Errorf("post-extraction check: pkg/config directory '%s' missing", pkgConfigFinalPath)
-			progress("pkg/config missing post-extraction.", 100)
+			temporaryModuleRootPathErr = fmt.Errorf("post-extraction check: pkg/config/models.go ('%s') missing", pkgConfigFinalPath)
+			progress("pkg/config/models.go missing post-extraction.", 100)
 			return
 		}
 		log.Printf("[res-mod-check] Verified existence of: %s", pkgConfigFinalPath)
@@ -535,4 +443,115 @@ go %s
 		log.Printf("[res-mod] Temporary module structure fully ready at: %s", temporaryModuleRootPath)
 	})
 	return temporaryModuleRootPath, temporaryModuleRootCleanupFunc, temporaryModuleRootPathErr
+}
+
+// extractFSDirContents extracts all files and directories from an embed.FS (starting at srcRootInEmbedFS)
+// to a destination on disk (destDiskDir).
+func extractFSDirContents(ctx context.Context, embedFS embed.FS, srcRootInEmbedFS string, destDiskDir string, extractionName string, progressSubOp ProgressFunc) error {
+	log.Printf("[extractFS-%s] Extracting from embedFS (src root in embed: '%s') to disk dir '%s'", extractionName, srcRootInEmbedFS, destDiskDir)
+
+	if err := os.MkdirAll(destDiskDir, 0755); err != nil {
+		return fmt.Errorf("creating base destination directory '%s' for %s: %w", destDiskDir, extractionName, err)
+	}
+
+	var filesProcessed uint64
+	var totalFilesToProcess uint64
+
+	// Count total files for progress calculation
+	errWalkCount := fs.WalkDir(embedFS, srcRootInEmbedFS, func(path string, d fs.DirEntry, errIn error) error {
+		if errIn != nil {
+			// Log and skip problematic entries during count, but don't fail the whole count.
+			log.Printf("[extractFS-%s] Warning: error accessing path '%s' during count: %v", extractionName, path, errIn)
+			if d != nil && d.IsDir() { // if it's a dir and error, skip it
+				return fs.SkipDir
+			}
+			return nil // if it's a file and error, just skip this file from count
+		}
+		if !d.IsDir() {
+			totalFilesToProcess++
+		}
+		return nil
+	})
+	if errWalkCount != nil { // Should not happen if WalkDirFunc returns nil for errors
+		log.Printf("[extractFS-%s] Error during file count walk: %v", extractionName, errWalkCount)
+		// Continue, progress might be inaccurate
+	}
+
+	if totalFilesToProcess == 0 && srcRootInEmbedFS != "." { // Check if srcRootInEmbedFS is valid
+		// Check if the source root itself exists
+		if _, errStat := fs.Stat(embedFS, srcRootInEmbedFS); os.IsNotExist(errStat) {
+			return fmt.Errorf("source root '%s' does not exist in embedded FS for %s", srcRootInEmbedFS, extractionName)
+		}
+		log.Printf("[extractFS-%s] No files to extract from embedFS (src root in embed: '%s'). This might be okay if it's an empty directory.", extractionName, srcRootInEmbedFS)
+		if progressSubOp != nil {
+			progressSubOp(fmt.Sprintf("No files in %s.", extractionName), 100)
+		}
+		// return nil // Not an error if there are truly no files
+	}
+	log.Printf("[extractFS-%s] Total files to extract: %d", extractionName, totalFilesToProcess)
+
+	return fs.WalkDir(embedFS, srcRootInEmbedFS, func(pathInEmbed string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			log.Printf("[extractFS-%s] Error walking at '%s': %v", extractionName, pathInEmbed, walkErr)
+			// If it's a directory, try to skip it. If a file, this error will propagate.
+			if d != nil && d.IsDir() {
+				return fs.SkipDir
+			}
+			return walkErr
+		}
+
+		select {
+		case <-ctx.Done():
+			log.Printf("[extractFS-%s] Extraction cancelled via context for path %s", extractionName, pathInEmbed)
+			return ctx.Err() // Propagate context cancellation
+		default:
+		}
+
+		// Calculate relative path from the srcRootInEmbedFS to the current pathInEmbed
+		relativePath, errRel := filepath.Rel(srcRootInEmbedFS, pathInEmbed)
+		if errRel != nil {
+			return fmt.Errorf("calculating relative path for '%s' (base '%s') in %s: %w", pathInEmbed, srcRootInEmbedFS, extractionName, errRel)
+		}
+
+		// If relativePath is ".", it means pathInEmbed is the same as srcRootInEmbedFS.
+		// We've already created destDiskDir which corresponds to srcRootInEmbedFS, so skip.
+		if relativePath == "." {
+			return nil
+		}
+
+		destPathOnDisk := filepath.Join(destDiskDir, relativePath)
+
+		if d.IsDir() {
+			if errMk := os.MkdirAll(destPathOnDisk, 0755); errMk != nil {
+				return fmt.Errorf("creating directory '%s' for %s: %w", destPathOnDisk, extractionName, errMk)
+			}
+			return nil // Done with this directory entry
+		}
+
+		// It's a file, ensure parent directory on disk exists
+		if errMkParent := os.MkdirAll(filepath.Dir(destPathOnDisk), 0755); errMkParent != nil {
+			return fmt.Errorf("creating parent directory for file '%s' for %s: %w", destPathOnDisk, extractionName, errMkParent)
+		}
+
+		fileData, readErr := embedFS.ReadFile(pathInEmbed)
+		if readErr != nil {
+			return fmt.Errorf("reading embedded %s file '%s': %w", extractionName, pathInEmbed, readErr)
+		}
+
+		if errWrite := os.WriteFile(destPathOnDisk, fileData, 0644); errWrite != nil { // Using 0644 for files
+			return fmt.Errorf("writing %s file '%s' to disk: %w", extractionName, destPathOnDisk, errWrite)
+		}
+
+		filesProcessed++
+		if progressSubOp != nil {
+			percent := 0
+			if totalFilesToProcess > 0 { // Avoid division by zero
+				percent = int(float64(filesProcessed) * 100.0 / float64(totalFilesToProcess))
+			}
+			// Format message carefully for progress display
+			msg := formatProgressMessage(fmt.Sprintf("Extracting %s: %%s", extractionName), relativePath, progressMessageMaxDisplayLength)
+			progressSubOp(msg, percent)
+		}
+		return nil
+	})
 }

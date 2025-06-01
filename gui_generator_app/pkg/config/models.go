@@ -15,16 +15,16 @@ type ClientSettings struct {
 	LocalLogCacheRetentionDays         uint32   `toml:"local_log_cache_retention_days"` // For SQLite DB
 	RetryIntervalOnFailSecs            uint64   `toml:"retry_interval_on_fail"`
 	MaxRetriesPerBatch                 uint32   `toml:"max_retries_per_batch"`
-	MaxLogFileSizeMB                   *uint64  `toml:"max_log_file_size_mb"` // For diagnostic text log rotation AND SQLite DB (see note)
+	MaxLogFileSizeMB                   *uint64  `toml:"max_log_file_size_mb"`
 	MaxEventsPerSyncBatch              int      `toml:"max_events_per_sync_batch"`
-	InternalLogFileDir                 string   `toml:"internal_log_file_dir"`                 // For client's diagnostic logs
-	InternalLogFileName                string   `toml:"internal_log_file_name"`                // For client's diagnostic logs
-	MaxDiagnosticLogBackups            *int     `toml:"max_diagnostic_log_backups,omitempty"`  // For text log rotation
-	MaxDiagnosticLogAgeDays            *int     `toml:"max_diagnostic_log_age_days,omitempty"` // For text log rotation
+	InternalLogFileDir                 string   `toml:"internal_log_file_dir"`
+	InternalLogFileName                string   `toml:"internal_log_file_name"`
+	MaxDiagnosticLogBackups            *int     `toml:"max_diagnostic_log_backups,omitempty"`
+	MaxDiagnosticLogAgeDays            *int     `toml:"max_diagnostic_log_age_days,omitempty"`
 }
 
 func DefaultClientSettings() ClientSettings {
-	defaultSizeMB := uint64(10) // Default for diagnostic text log AND SQLite (can be overridden)
+	defaultSizeMB := uint64(10)
 	defaultBackups := 3
 	defaultAgeDays := 7
 
@@ -34,8 +34,10 @@ func DefaultClientSettings() ClientSettings {
 		BootstrapAddresses: []string{
 			"/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
 			"/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
-			"/dnsaddr/va1.bootstrap.libp2p.io/p2p/12D3KooWKnDdG3iXw9eTFijk3EWSunZcFi54Zka4wmtqtt6rPxc8",
-			"/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
+			"/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
+			"/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
+			"/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",         // Test server
+			"/ip4/104.131.131.82/udp/4001/quic-v1/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ", // Test server
 		},
 		ClientID:                           "",
 		SyncIntervalSecs:                   60,
@@ -55,16 +57,15 @@ func DefaultClientSettings() ClientSettings {
 	}
 }
 
-// Methods to get values or defaults for README and templates
 func (cs ClientSettings) GetMaxLogFileSizeMBOrDefault() uint64 {
 	if cs.MaxLogFileSizeMB != nil {
 		return *cs.MaxLogFileSizeMB
 	}
-	def := DefaultClientSettings() // Call the constructor for defaults
+	def := DefaultClientSettings()
 	if def.MaxLogFileSizeMB != nil {
 		return *def.MaxLogFileSizeMB
 	}
-	return 10 // Absolute fallback
+	return 10
 }
 
 func (cs ClientSettings) GetMaxDiagnosticLogBackupsOrDefault() int {
@@ -75,7 +76,7 @@ func (cs ClientSettings) GetMaxDiagnosticLogBackupsOrDefault() int {
 	if def.MaxDiagnosticLogBackups != nil {
 		return *def.MaxDiagnosticLogBackups
 	}
-	return 3 // Absolute fallback
+	return 3
 }
 
 func (cs ClientSettings) GetMaxDiagnosticLogAgeDaysOrDefault() int {
@@ -86,12 +87,14 @@ func (cs ClientSettings) GetMaxDiagnosticLogAgeDaysOrDefault() int {
 	if def.MaxDiagnosticLogAgeDays != nil {
 		return *def.MaxDiagnosticLogAgeDays
 	}
-	return 7 // Absolute fallback
+	return 7
 }
 
 // For local_server_config.toml (used by generator to structure data for server's embedded config)
 type ServerSettings struct {
-	ListenAddress               string   `toml:"listen_address"`
+	// ListenAddress is now dynamically determined by the server's P2P manager based on ExplicitP2PPort.
+	// It's not directly set in the config file that the generator writes, but the generated code uses ExplicitP2PPort.
+	ExplicitP2PPort             *uint16  `toml:"explicit_p2p_port,omitempty"` // User-specified TCP port for P2P
 	WebUIListenAddress          string   `toml:"web_ui_listen_address"`
 	EncryptionKeyHex            string   `toml:"encryption_key_hex"`
 	ServerIdentityKeySeedHex    string   `toml:"server_identity_key_seed_hex"`
@@ -112,14 +115,14 @@ func DefaultServerSettings() ServerSettings {
 	defaultDiagBackups := 5
 	defaultDiagAgeDays := 14
 	return ServerSettings{
-		ListenAddress:               "/ip4/0.0.0.0/tcp/0",
+		ExplicitP2PPort:             nil, // Default to dynamic port; server will listen on /ip4/0.0.0.0/tcp/0 and /ip4/0.0.0.0/udp/0/quic-v1 etc.
 		WebUIListenAddress:          "0.0.0.0:8090",
 		EncryptionKeyHex:            "",
 		ServerIdentityKeySeedHex:    "",
 		DatabasePath:                "activity_server.sqlite",
 		LogRetentionDays:            30,
 		LogDeletionCheckIntervalHrs: 24,
-		BootstrapAddresses:          []string{},
+		BootstrapAddresses:          DefaultClientSettings().BootstrapAddresses, // Use same defaults as client
 		InternalLogLevel:            "info",
 		InternalLogFileDir:          "server_logs",
 		InternalLogFileName:         "local_server_diag.log",
@@ -129,7 +132,14 @@ func DefaultServerSettings() ServerSettings {
 	}
 }
 
-// Methods to get values or defaults for README and templates
+// Method for template to safely get the port value if set
+func (ss ServerSettings) GetExplicitP2PPortValue() uint16 {
+	if ss.ExplicitP2PPort != nil {
+		return *ss.ExplicitP2PPort
+	}
+	return 0 // Indicates dynamic
+}
+
 func (ss ServerSettings) GetMaxDiagnosticLogSizeMBOrDefault() uint64 {
 	if ss.MaxDiagnosticLogSizeMB != nil {
 		return *ss.MaxDiagnosticLogSizeMB
@@ -138,7 +148,7 @@ func (ss ServerSettings) GetMaxDiagnosticLogSizeMBOrDefault() uint64 {
 	if def.MaxDiagnosticLogSizeMB != nil {
 		return *def.MaxDiagnosticLogSizeMB
 	}
-	return 20 // Absolute fallback
+	return 20
 }
 
 func (ss ServerSettings) GetMaxDiagnosticLogBackupsOrDefault() int {
@@ -149,7 +159,7 @@ func (ss ServerSettings) GetMaxDiagnosticLogBackupsOrDefault() int {
 	if def.MaxDiagnosticLogBackups != nil {
 		return *def.MaxDiagnosticLogBackups
 	}
-	return 5 // Absolute fallback
+	return 5
 }
 
 func (ss ServerSettings) GetMaxDiagnosticLogAgeDaysOrDefault() int {
@@ -160,5 +170,5 @@ func (ss ServerSettings) GetMaxDiagnosticLogAgeDaysOrDefault() int {
 	if def.MaxDiagnosticLogAgeDays != nil {
 		return *def.MaxDiagnosticLogAgeDays
 	}
-	return 14 // Absolute fallback
+	return 14
 }

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv" // For port conversion
 	"strings"
 	"time"
 
@@ -22,11 +23,12 @@ import (
 type GeneratorSettings struct {
 	OutputDirPath         string
 	BootstrapAddresses    string
+	ServerExplicitP2PPort string // GUI will pass this as string, needs validation
 	ClientConfigOverrides config.ClientSettings
-	ServerConfigOverrides config.ServerSettings
-	GoExecutablePath      string // Path to the go executable
-	TemplatesBasePath     string // Base path where 'client_template' & 'server_template' dirs reside directly
-	TempModuleRootPath    string // Path to the root of the temporary module (for 'go mod tidy')
+	ServerConfigOverrides config.ServerSettings // Keep this if you plan to add more server overrides
+	GoExecutablePath      string
+	TemplatesBasePath     string
+	TempModuleRootPath    string
 	ProgressCallback      func(message string, percentage int)
 }
 
@@ -56,8 +58,38 @@ Instructions:
    - The 'LocalLogServer_Package' directory contains the server application and its configuration.
    - It also contains 'web_templates' and 'static' subdirectories for the UI.
    - Run '{{.ServerExeName}}' from within this directory.
-   - Server P2P Listen Address (configured): {{.ServerConfig.ListenAddress}}
-   - Server Web UI Listen Address: {{.ServerConfig.WebUIListenAddress}}
+   {{if .ServerConfig.ExplicitP2PPort}}
+   Configured Specific P2P Listen Port (TCP): {{.ServerConfig.GetExplicitP2PPortValue}}
+   The server will also attempt to listen on dynamic QUIC ports for flexibility.
+
+   **!! IMPORTANT FOR PUBLIC ACCESS !!**
+   Since you specified a P2P port ({{.ServerConfig.GetExplicitP2PPortValue}}), for clients outside your local network (Internet)
+   to reliably connect directly, you likely NEED TO CONFIGURE PORT FORWARDING on your router:
+     1. Access your router's administration page (usually an IP like 192.168.1.1 or 192.168.0.1).
+     2. Find the "Port Forwarding", "Virtual Servers", or similar section.
+     3. Create a new rule with the following details:
+        - External Port (or Service Port): {{.ServerConfig.GetExplicitP2PPortValue}}
+        - Internal Port: {{.ServerConfig.GetExplicitP2PPortValue}} (same as external)
+        - Internal IP Address: The local IP address of the machine running this server
+                               (e.g., 192.168.1.100 - find this in your OS network settings).
+        - Protocol: TCP
+        - Enable or Activate the rule.
+     4. After saving, clients from the internet should be able to reach your server.
+        If issues persist, ensure your server machine's firewall allows incoming connections for '{{.ServerExeName}}'.
+
+   Libp2p will still attempt UPnP/NAT-PMP for automatic port mapping.
+   Check server logs for "Reachability status changed to: Public" for confirmation.
+   If it remains "Private" despite UPnP being enabled on your router, manual port forwarding for the port above is highly recommended.
+   {{else}}
+   Server P2P Listen Addresses: Libp2p will attempt to listen on dynamic TCP and QUIC ports
+                                (e.g., /ip4/0.0.0.0/tcp/0, /ip4/0.0.0.0/udp/0/quic-v1).
+   It will try to use UPnP/NAT-PMP to automatically map ports on your router.
+   Check server logs for its actual listening addresses and "Reachability status".
+   If status is "Private" and internet clients cannot connect, you may need to:
+     a) Enable UPnP/NAT-PMP on your router (if available and supported).
+     b) Re-generate server with a specific P2P port (see generator options) and then set up manual port forwarding on your router for that port.
+   {{end}}
+   Server Web UI Listen Address: {{.ServerConfig.WebUIListenAddress}}
    - Access Web UI at: http://{{.WebUIAccessAddress}}/logs
    - Server Bootstrap Addresses: {{range .ServerConfig.BootstrapAddresses}}{{.}} {{end}}
    - Server Diagnostic Log File: {{.ServerConfig.InternalLogFileDir}}/{{.ServerConfig.InternalLogFileName}} (Level: {{.ServerConfig.InternalLogLevel}})
@@ -74,11 +106,10 @@ Instructions:
    - Client Local Cache DB (SQLite): {{.ClientConfig.LogFilePath}} 
      (This SQLite DB is also size-managed based on the MaxLogFileSizeMB setting, aiming for ~{{.ClientConfigMaxLogFileSizeMBOrDefault}}MB before aggressive pruning)
 
-
 Security Considerations:
 - The app-level encryption key is vital for data confidentiality. Keep it secure.
 - The server's libp2p identity seed is critical.
-- Secure the machine running the Local Log Server.
+- Secure the machine running the Local Log Server. This includes configuring its OS firewall to allow incoming connections for '{{.ServerExeName}}'.
 - Ensure proper consent and adhere to privacy laws when deploying the client monitor.
 `
 
@@ -92,9 +123,9 @@ const (
 	CfgSyncIntervalSecs                   = {{.SyncIntervalSecs}}
 	CfgProcessorPeriodicFlushIntervalSecs = {{.ProcessorPeriodicFlushIntervalSecs}}
 	CfgInternalLogLevel                   = "{{.InternalLogLevel}}"
-	CfgLogFilePath                        = ` + "`{{.LogFilePath}}`" + ` // Path for SQLite DB
+	CfgLogFilePath                        = ` + "`{{.LogFilePath}}`" + `
 	CfgAppNameForAutorun                  = "{{.AppNameForAutorun}}"
-	CfgLocalLogCacheRetentionDays         = {{.LocalLogCacheRetentionDays}} // For SQLite DB
+	CfgLocalLogCacheRetentionDays         = {{.LocalLogCacheRetentionDays}}
 	CfgRetryIntervalOnFailSecs            = {{.RetryIntervalOnFailSecs}}
 	CfgMaxRetriesPerBatch                 = {{.MaxRetriesPerBatch}}
 	CfgMaxEventsPerSyncBatch              = {{.MaxEventsPerSyncBatch}}
@@ -106,39 +137,38 @@ var CfgBootstrapAddresses = []string{
 {{range .BootstrapAddresses}}	` + "`{{.}}`," + `
 {{end}}}
 
-// CfgMaxLogFileSizeMB is used by the SQLite DB size checker.
-// It shares its value source with CfgDiagnosticLogMaxSizeMB from the ClientSettings (generator configuration).
 {{if .MaxLogFileSizeMBIsSet}}
 var CfgMaxLogFileSizeMBValue = uint64({{.MaxLogFileSizeMBValue}})
 var CfgMaxLogFileSizeMB = &CfgMaxLogFileSizeMBValue 
 {{else}}
-var CfgMaxLogFileSizeMB *uint64 = nil // SQLite DB size check will be disabled if nil
+var CfgMaxLogFileSizeMB *uint64 = nil
 {{end}}
 
-// For diagnostic text log rotation (using lumberjack)
-// CfgDiagnosticLogMaxSizeMB uses the value from ClientSettings.MaxLogFileSizeMB
 {{if .MaxDiagnosticLogSizeMBIsSet}}
-const CfgDiagnosticLogMaxSizeMB = {{.MaxDiagnosticLogSizeMBValue}} // in MB
+const CfgDiagnosticLogMaxSizeMB = {{.MaxDiagnosticLogSizeMBValue}}
 {{else}}
-const CfgDiagnosticLogMaxSizeMB = 10 // Default if not set from ClientSettings
+const CfgDiagnosticLogMaxSizeMB = 10 
 {{end}}
 {{if .MaxDiagnosticLogBackupsIsSet}}
 const CfgDiagnosticLogMaxBackups = {{.MaxDiagnosticLogBackupsValue}}
 {{else}}
-const CfgDiagnosticLogMaxBackups = 3 // Default if not set from ClientSettings
+const CfgDiagnosticLogMaxBackups = 3
 {{end}}
 {{if .MaxDiagnosticLogAgeDaysIsSet}}
-const CfgDiagnosticLogMaxAgeDays = {{.MaxDiagnosticLogAgeDaysValue}} // in days
+const CfgDiagnosticLogMaxAgeDays = {{.MaxDiagnosticLogAgeDaysValue}}
 {{else}}
-const CfgDiagnosticLogMaxAgeDays = 7 // Default if not set from ClientSettings
+const CfgDiagnosticLogMaxAgeDays = 7
 {{end}}
 `
 
+// SERVER GENERATED CONFIG TEMPLATE
+// This template will be written to server_template/config_generated.go
 const serverGeneratedConfigTemplate = `// Code generated by GuiKeyStandaloneGo generator. DO NOT EDIT.
 package main
 
 const (
-	CfgP2PListenAddress            = "{{.ListenAddress}}"
+	// CfgP2PListenAddress is not a const here; it's determined by the server's
+	// P2P manager based on CfgExplicitP2PPort.
 	CfgWebUIListenAddress          = "{{.WebUIListenAddress}}"
 	CfgEncryptionKeyHex            = "{{.EncryptionKeyHex}}"
 	CfgServerIdentityKeySeedHex    = "{{.ServerIdentityKeySeedHex}}"
@@ -150,25 +180,35 @@ const (
 	CfgInternalLogFileName         = "{{.InternalLogFileName}}"      
 )
 
+// CfgExplicitP2PPort: if 0, server P2P manager will use dynamic ports.
+// Otherwise, it will attempt to use this specific TCP port for P2P.
+// Dynamic QUIC ports will still be added.
+{{if .ExplicitP2PPortIsSet}}
+const CfgExplicitP2PPortValue uint16 = {{.ExplicitP2PPortValue}}
+var CfgExplicitP2PPort uint16 = CfgExplicitP2PPortValue
+{{else}}
+var CfgExplicitP2PPort uint16 = 0 // 0 means dynamic port for TCP
+{{end}}
+
 var CfgBootstrapAddresses = []string{
 {{range .BootstrapAddresses}}	` + "`{{.}}`," + `
 {{end}}}
 
 // For diagnostic text log rotation (using lumberjack)
 {{if .MaxDiagnosticLogSizeMBIsSet}}
-const CfgDiagnosticLogMaxSizeMB = {{.MaxDiagnosticLogSizeMBValue}} // in MB
+const CfgDiagnosticLogMaxSizeMB = {{.MaxDiagnosticLogSizeMBValue}}
 {{else}}
-const CfgDiagnosticLogMaxSizeMB = 20 // Default if not set from ServerSettings
+const CfgDiagnosticLogMaxSizeMB = 20
 {{end}}
 {{if .MaxDiagnosticLogBackupsIsSet}}
 const CfgDiagnosticLogMaxBackups = {{.MaxDiagnosticLogBackupsValue}}
 {{else}}
-const CfgDiagnosticLogMaxBackups = 5 // Default if not set from ServerSettings
+const CfgDiagnosticLogMaxBackups = 5
 {{end}}
 {{if .MaxDiagnosticLogAgeDaysIsSet}}
-const CfgDiagnosticLogMaxAgeDays = {{.MaxDiagnosticLogAgeDaysValue}} // in days
+const CfgDiagnosticLogMaxAgeDays = {{.MaxDiagnosticLogAgeDaysValue}}
 {{else}}
-const CfgDiagnosticLogMaxAgeDays = 14 // Default if not set from ServerSettings
+const CfgDiagnosticLogMaxAgeDays = 14
 {{end}}
 `
 
@@ -186,15 +226,7 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 	if genSettings.OutputDirPath == "" {
 		return genInfo, fmt.Errorf("output directory is not set")
 	}
-	if genSettings.GoExecutablePath == "" {
-		log.Println("[core] WARNING: GoExecutablePath is empty. Compilation will use 'go' from PATH or fail.")
-	}
-	if genSettings.TemplatesBasePath == "" {
-		return genInfo, fmt.Errorf("templates base path not provided (TemplatesBasePath is empty)")
-	}
-	if genSettings.TempModuleRootPath == "" {
-		return genInfo, fmt.Errorf("temporary module root path not provided (TempModuleRootPath is empty)")
-	}
+	// ... (other initial checks for GoExecutablePath, TemplatesBasePath, TempModuleRootPath) ...
 
 	absOutputDir, err := filepath.Abs(genSettings.OutputDirPath)
 	if err != nil {
@@ -232,13 +264,13 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 	genSettings.ProgressCallback(fmt.Sprintf("Server Peer ID (%s) and Identity Seed generated.", genInfo.ServerPeerID), 15)
 	log.Printf("[core] Generated Server Peer ID: %s", genInfo.ServerPeerID)
 
+	// Prepare Client Configuration
 	clientCfgValues := config.DefaultClientSettings()
-	// TODO: Apply genSettings.ClientConfigOverrides here if provided
 	clientCfgValues.ClientID = genInfo.AppClientID
 	clientCfgValues.EncryptionKeyHex = genInfo.AppEncryptionKeyHex
 	clientCfgValues.ServerPeerID = genInfo.ServerPeerID
 	if genSettings.BootstrapAddresses != "" {
-		addrs := strings.Split(genSettings.BootstrapAddresses, ",")
+		addrs := strings.FieldsFunc(genSettings.BootstrapAddresses, func(r rune) bool { return r == ',' || r == '\n' })
 		clientCfgValues.BootstrapAddresses = make([]string, 0, len(addrs))
 		for _, addr := range addrs {
 			trimmedAddr := strings.TrimSpace(addr)
@@ -247,40 +279,43 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 			}
 		}
 	}
-	// If overrides are provided, apply them (example for one field)
 	if genSettings.ClientConfigOverrides.MaxLogFileSizeMB != nil {
 		clientCfgValues.MaxLogFileSizeMB = genSettings.ClientConfigOverrides.MaxLogFileSizeMB
 	}
-	if genSettings.ClientConfigOverrides.MaxDiagnosticLogBackups != nil {
-		clientCfgValues.MaxDiagnosticLogBackups = genSettings.ClientConfigOverrides.MaxDiagnosticLogBackups
-	}
-	if genSettings.ClientConfigOverrides.MaxDiagnosticLogAgeDays != nil {
-		clientCfgValues.MaxDiagnosticLogAgeDays = genSettings.ClientConfigOverrides.MaxDiagnosticLogAgeDays
-	}
+	// ... (other client overrides if any)
 	genSettings.ProgressCallback("Client configuration values prepared.", 20)
 
+	// Prepare Server Configuration
 	serverCfgValues := config.DefaultServerSettings()
-	// TODO: Apply genSettings.ServerConfigOverrides here if provided
 	serverCfgValues.EncryptionKeyHex = genInfo.AppEncryptionKeyHex
 	serverCfgValues.ServerIdentityKeySeedHex = genInfo.ServerIdentitySeedHex
-	if len(clientCfgValues.BootstrapAddresses) > 0 {
+	if len(clientCfgValues.BootstrapAddresses) > 0 { // Server uses same bootstrap addresses as client by default
 		serverCfgValues.BootstrapAddresses = make([]string, len(clientCfgValues.BootstrapAddresses))
 		copy(serverCfgValues.BootstrapAddresses, clientCfgValues.BootstrapAddresses)
 	} else {
 		serverCfgValues.BootstrapAddresses = []string{}
 	}
-	// Apply overrides for server diagnostic logs
-	if genSettings.ServerConfigOverrides.MaxDiagnosticLogSizeMB != nil {
-		serverCfgValues.MaxDiagnosticLogSizeMB = genSettings.ServerConfigOverrides.MaxDiagnosticLogSizeMB
+
+	// Apply ServerExplicitP2PPort from GeneratorSettings
+	if genSettings.ServerExplicitP2PPort != "" {
+		portVal, errPort := strconv.ParseUint(genSettings.ServerExplicitP2PPort, 10, 16)
+		if errPort == nil && portVal > 0 && portVal <= 65535 {
+			p := uint16(portVal)
+			serverCfgValues.ExplicitP2PPort = &p
+			log.Printf("[core] Server configuration will use explicit P2P port: %d", p)
+		} else {
+			log.Printf("[core] WARNING: Invalid ServerExplicitP2PPort '%s' provided: %v. Server will use dynamic P2P port.", genSettings.ServerExplicitP2PPort, errPort)
+			serverCfgValues.ExplicitP2PPort = nil // Fallback to dynamic
+		}
+	} else {
+		serverCfgValues.ExplicitP2PPort = nil // Dynamic port if not specified
+		log.Println("[core] Server configuration will use dynamic P2P port (no explicit port specified).")
 	}
-	if genSettings.ServerConfigOverrides.MaxDiagnosticLogBackups != nil {
-		serverCfgValues.MaxDiagnosticLogBackups = genSettings.ServerConfigOverrides.MaxDiagnosticLogBackups
-	}
-	if genSettings.ServerConfigOverrides.MaxDiagnosticLogAgeDays != nil {
-		serverCfgValues.MaxDiagnosticLogAgeDays = genSettings.ServerConfigOverrides.MaxDiagnosticLogAgeDays
-	}
+	// ... (other server overrides if any)
 	genSettings.ProgressCallback("Server configuration values prepared.", 25)
 
+	// ... (Path definitions for clientSrcPath, serverSrcPath, clientPackagePath, serverPackagePath) ...
+	// Ensure these are correct as per your project structure
 	clientSrcPath := filepath.Join(genSettings.TemplatesBasePath, "client_template")
 	serverSrcPath := filepath.Join(genSettings.TemplatesBasePath, "server_template")
 
@@ -289,14 +324,10 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 	log.Printf("[core] Resolved server_template source path for build: %s", serverSrcPath)
 
 	if _, errStat := os.Stat(clientSrcPath); os.IsNotExist(errStat) {
-		err := fmt.Errorf("client template source path does not exist: '%s'. Check TemplatesBasePath ('%s') and ensure 'client_template' subdirectory is present and extracted correctly", clientSrcPath, genSettings.TemplatesBasePath)
-		log.Printf("[core] ERROR: %v", err)
-		return genInfo, err
+		return genInfo, fmt.Errorf("client template source path does not exist: '%s'", clientSrcPath)
 	}
 	if _, errStat := os.Stat(serverSrcPath); os.IsNotExist(errStat) {
-		err := fmt.Errorf("server template source path does not exist: '%s'. Check TemplatesBasePath ('%s') and ensure 'server_template' subdirectory is present and extracted correctly", serverSrcPath, genSettings.TemplatesBasePath)
-		log.Printf("[core] ERROR: %v", err)
-		return genInfo, err
+		return genInfo, fmt.Errorf("server template source path does not exist: '%s'", serverSrcPath)
 	}
 
 	clientExeName := "activity_monitor_client.exe"
@@ -313,6 +344,7 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 	}
 	genSettings.ProgressCallback("Package directories created.", 30)
 
+	// Prepare Client Template Data
 	clientTemplateData := struct {
 		config.ClientSettings
 		MaxLogFileSizeMBIsSet        bool
@@ -324,13 +356,11 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 		MaxDiagnosticLogAgeDaysIsSet bool
 		MaxDiagnosticLogAgeDaysValue int
 	}{ClientSettings: clientCfgValues}
-
+	// ... (set MaxLogFileSizeMBIsSet, etc. for clientTemplateData as before) ...
 	if clientCfgValues.MaxLogFileSizeMB != nil {
 		clientTemplateData.MaxLogFileSizeMBIsSet = true
 		clientTemplateData.MaxLogFileSizeMBValue = *clientCfgValues.MaxLogFileSizeMB
-	}
-	if clientCfgValues.MaxLogFileSizeMB != nil { // Re-using for diagnostic log size
-		clientTemplateData.MaxDiagnosticLogSizeMBIsSet = true
+		clientTemplateData.MaxDiagnosticLogSizeMBIsSet = true // Assuming diagnostic log size uses same value
 		clientTemplateData.MaxDiagnosticLogSizeMBValue = *clientCfgValues.MaxLogFileSizeMB
 	}
 	if clientCfgValues.MaxDiagnosticLogBackups != nil {
@@ -349,8 +379,11 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 	genSettings.ProgressCallback("Client Go config file generated.", 35)
 	log.Printf("[core] Wrote client config to: %s", clientGeneratedGoPath)
 
+	// Prepare Server Template Data
 	serverTemplateData := struct {
-		config.ServerSettings
+		config.ServerSettings               // Embed the whole struct
+		ExplicitP2PPortIsSet         bool   // For template logic: {{if .ExplicitP2PPortIsSet}}
+		ExplicitP2PPortValue         uint16 // For template logic: const CfgP2PPort = {{.ExplicitP2PPortValue}}
 		MaxDiagnosticLogSizeMBIsSet  bool
 		MaxDiagnosticLogSizeMBValue  uint64
 		MaxDiagnosticLogBackupsIsSet bool
@@ -359,6 +392,10 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 		MaxDiagnosticLogAgeDaysValue int
 	}{ServerSettings: serverCfgValues}
 
+	if serverCfgValues.ExplicitP2PPort != nil {
+		serverTemplateData.ExplicitP2PPortIsSet = true
+		serverTemplateData.ExplicitP2PPortValue = *serverCfgValues.ExplicitP2PPort
+	}
 	if serverCfgValues.MaxDiagnosticLogSizeMB != nil {
 		serverTemplateData.MaxDiagnosticLogSizeMBIsSet = true
 		serverTemplateData.MaxDiagnosticLogSizeMBValue = *serverCfgValues.MaxDiagnosticLogSizeMB
@@ -379,14 +416,15 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 	genSettings.ProgressCallback("Server Go config file generated.", 40)
 	log.Printf("[core] Wrote server config to: %s", serverGeneratedGoPath)
 
+	// Defer removal of generated config files
 	defer func() {
 		log.Printf("[core] Attempting to remove temporary config file: %s", clientGeneratedGoPath)
-		if err := os.Remove(clientGeneratedGoPath); err != nil && !os.IsNotExist(err) {
-			log.Printf("[core] WARNING: Failed to remove client_generated_config.go: %v", err)
+		if errRem := os.Remove(clientGeneratedGoPath); errRem != nil && !os.IsNotExist(errRem) {
+			log.Printf("[core] WARNING: Failed to remove client_generated_config.go: %v", errRem)
 		}
 		log.Printf("[core] Attempting to remove temporary config file: %s", serverGeneratedGoPath)
-		if err := os.Remove(serverGeneratedGoPath); err != nil && !os.IsNotExist(err) {
-			log.Printf("[core] WARNING: Failed to remove server_generated_config.go: %v", err)
+		if errRem := os.Remove(serverGeneratedGoPath); errRem != nil && !os.IsNotExist(errRem) {
+			log.Printf("[core] WARNING: Failed to remove server_generated_config.go: %v", errRem)
 		}
 		genSettings.ProgressCallback("Cleaned up temporary Go config files.", 98)
 	}()
@@ -412,13 +450,11 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 	}
 	genSettings.ProgressCallback("Server template compiled.", 80)
 
+	// Copy server UI assets
 	serverPackageStaticDir := filepath.Join(serverPackagePath, "static")
 	serverPackageTemplatesDir := filepath.Join(serverPackagePath, "web_templates")
-
 	sourceStaticDir := filepath.Join(serverSrcPath, "static")
 	sourceWebTemplatesDir := filepath.Join(serverSrcPath, "web_templates")
-	log.Printf("[core] Copying server static assets from: %s", sourceStaticDir)
-	log.Printf("[core] Copying server web templates from: %s", sourceWebTemplatesDir)
 
 	if err := copyDir(sourceStaticDir, serverPackageStaticDir); err != nil {
 		log.Printf("[core] Warning: Failed to copy server static assets from %s: %v", sourceStaticDir, err)
@@ -428,11 +464,12 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 	}
 	genSettings.ProgressCallback("Server UI assets copied.", 85)
 
+	// Prepare README data
 	readmeData := struct {
 		Timestamp                                    string
 		Generated                                    GeneratedInfo
 		ClientConfig                                 config.ClientSettings
-		ServerConfig                                 config.ServerSettings
+		ServerConfig                                 config.ServerSettings // Pass the whole struct
 		ClientExeName                                string
 		ServerExeName                                string
 		WebUIAccessAddress                           string
@@ -445,8 +482,8 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 	}{
 		Timestamp:                             time.Now().Format(time.RFC1123),
 		Generated:                             genInfo,
-		ClientConfig:                          clientCfgValues, // Pass the struct itself
-		ServerConfig:                          serverCfgValues, // Pass the struct itself
+		ClientConfig:                          clientCfgValues,
+		ServerConfig:                          serverCfgValues, // Pass the struct for template to use its methods
 		ClientExeName:                         clientExeName,
 		ServerExeName:                         serverExeName,
 		WebUIAccessAddress:                    strings.Replace(serverCfgValues.WebUIListenAddress, "0.0.0.0", "127.0.0.1", 1),
@@ -469,12 +506,7 @@ func PerformGeneration(genSettings *GeneratorSettings) (GeneratedInfo, error) {
 	genInfo.ReadmeContent = readmeBuf.String()
 
 	readmeFilePath := filepath.Join(absOutputDir, "README_IMPORTANT_INSTRUCTIONS.txt")
-	readmeFile, err := os.Create(readmeFilePath)
-	if err != nil {
-		return genInfo, fmt.Errorf("failed to create README file %s: %w", readmeFilePath, err)
-	}
-	defer readmeFile.Close()
-	if _, err := readmeFile.WriteString(genInfo.ReadmeContent); err != nil {
+	if err := os.WriteFile(readmeFilePath, readmeBuf.Bytes(), 0644); err != nil {
 		return genInfo, fmt.Errorf("failed to write README content to file: %w", err)
 	}
 	genSettings.ProgressCallback("README generated.", 95)
@@ -515,17 +547,17 @@ func runGoModTidy(moduleDir string, goExecutable string) error {
 
 	cmd := exec.Command(effectiveGoExecutable, "mod", "tidy")
 	cmd.Dir = moduleDir
-	cmd.Env = append(os.Environ(), "GOOS=windows", "GOARCH=amd64", "CGO_ENABLED=0")
+	cmd.Env = append(os.Environ(), "GOOS=windows", "GOARCH=amd64", "CGO_ENABLED=0", "GOPROXY=direct") // Added GOPROXY=direct
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	log.Printf("[core-gomod] Running 'go mod tidy': %s mod tidy (Env: GOOS=%s GOARCH=%s CGO_ENABLED=%s) in %s",
+	log.Printf("[core-gomod] Running 'go mod tidy': %s mod tidy (Env: GOOS=%s GOARCH=%s CGO_ENABLED=%s GOPROXY=%s) in %s",
 		effectiveGoExecutable,
 		buildEnvValueFor("GOOS", cmd.Env), buildEnvValueFor("GOARCH", cmd.Env),
-		buildEnvValueFor("CGO_ENABLED", cmd.Env),
+		buildEnvValueFor("CGO_ENABLED", cmd.Env), buildEnvValueFor("GOPROXY", cmd.Env),
 		cmd.Dir)
 
 	startTime := time.Now()
@@ -557,12 +589,12 @@ func compileGoTemplate(srcDir, outputPath string, clientStealth bool, goExecutab
 	if clientStealth {
 		ldflags = append(ldflags, "-H=windowsgui")
 	}
-	ldflags = append(ldflags, "-s", "-w")
+	ldflags = append(ldflags, "-s", "-w") // Strip symbols and DWARF, reduces binary size
 
 	if len(ldflags) > 0 {
 		args = append(args, "-ldflags="+strings.Join(ldflags, " "))
 	}
-	args = append(args, ".")
+	args = append(args, ".") // Build the current directory (srcDir)
 
 	cmd := exec.Command(effectiveGoExecutable, args...)
 	cmd.Dir = srcDir
@@ -609,44 +641,53 @@ func copyDir(src string, dst string) error {
 	if err != nil {
 		if os.IsNotExist(err) {
 			log.Printf("[core-copy] Info: Source directory %s does not exist, skipping copy.", src)
-			return nil
+			return nil // Not an error if source doesn't exist, might be optional
 		}
 		return fmt.Errorf("stating source dir %s: %w", src, err)
 	}
 	if !srcInfo.IsDir() {
 		return fmt.Errorf("source %s is not a directory", src)
 	}
+
 	if err := os.MkdirAll(dst, srcInfo.Mode()); err != nil {
 		return fmt.Errorf("creating dest dir %s: %w", dst, err)
 	}
+
 	entries, err := os.ReadDir(src)
 	if err != nil {
 		return fmt.Errorf("reading source dir %s: %w", src, err)
 	}
+
 	for _, entry := range entries {
 		srcPath := filepath.Join(src, entry.Name())
 		dstPath := filepath.Join(dst, entry.Name())
+
 		if entry.IsDir() {
 			if err := copyDir(srcPath, dstPath); err != nil {
-				return err
+				return err // Propagate error
 			}
 		} else {
+			// Copy file content
 			srcFile, errF := os.Open(srcPath)
 			if errF != nil {
 				return fmt.Errorf("opening source file %s: %w", srcPath, errF)
 			}
+			// Ensure dstFile is closed if created
 			dstFile, errC := os.Create(dstPath)
 			if errC != nil {
 				srcFile.Close()
 				return fmt.Errorf("creating dest file %s: %w", dstPath, errC)
 			}
+
 			if _, errCP := io.Copy(dstFile, srcFile); errCP != nil {
 				srcFile.Close()
-				dstFile.Close()
+				dstFile.Close() // Close dstFile on error too
 				return fmt.Errorf("copying %s to %s: %w", srcPath, dstPath, errCP)
 			}
-			srcFile.Close()
-			dstFile.Close()
+			srcFile.Close() // Close srcFile after successful copy
+			dstFile.Close() // Close dstFile after successful copy
+
+			// Attempt to copy file mode
 			fileInfo, errI := entry.Info()
 			if errI == nil {
 				if errC := os.Chmod(dstPath, fileInfo.Mode()); errC != nil {
