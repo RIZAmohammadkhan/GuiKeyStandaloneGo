@@ -177,15 +177,3 @@ This section is for developers who want to build `GenMon.exe` from the source co
     *   Enhance the server's Web UI with features like filtering, searching, and potentially user accounts.
     *   Further harden P2P connectivity, including more sophisticated NAT traversal techniques and connection management.
     *   Develop a comprehensive automated testing suite for client/server interactions.
-
-## Contributing
-
-Contributions to GenMon are welcome!
-
-*   **Reporting Bugs:** Please open an issue on GitHub. Include your Go version (if building from source), OS details, steps to reproduce the bug, expected behavior, actual behavior, and any relevant log snippets.
-*   **Suggesting Enhancements:** Open an issue to discuss your ideas. Describe the feature, its use case, and potential benefits.
-*   **Pull Requests:** Feel free to fork the repository and submit pull requests for bug fixes or approved features. Please ensure your code follows existing style and includes tests where appropriate.
-
-## License
-
-This project is currently unlicensed. Please contact the repository owner for licensing information or assume standard copyright applies. (Placeholder: Consider choosing an open-source license like MIT or Apache 2.0).
