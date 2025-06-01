@@ -198,6 +198,7 @@ func handleIncomingLogStream(stream network.Stream, logger *log.Logger, store *S
 
 func (pm *ServerP2PManager) StartBootstrapAndDiscovery(ctx context.Context) {
 	pm.logger.Println("Server P2P: Starting bootstrap, discovery, and advertising processes...")
+
 	if len(pm.bootstrapAddrInfos) > 0 {
 		pm.logger.Printf("Server P2P: Connecting to %d bootstrap peers...", len(pm.bootstrapAddrInfos))
 		var wg sync.WaitGroup
@@ -211,11 +212,27 @@ func (pm *ServerP2PManager) StartBootstrapAndDiscovery(ctx context.Context) {
 				connectCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 				defer cancel()
 				if err := pm.host.Connect(connectCtx, peerInfo); err != nil {
-					// pm.logger.Printf("Server P2P: Failed to connect to bootstrap peer %s: %v", peerInfo.ID, err)
+					// Silently ignore connection failures to bootstrap peers
 				} else {
 					pm.logger.Printf("Server P2P: Successfully connected to bootstrap peer: %s", peerInfo.ID.String())
 				}
 			}(pi)
+		}
+
+		// Wait for bootstrap connections with timeout
+		done := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			pm.logger.Println("Server P2P: Bootstrap connection attempts completed")
+		case <-time.After(45 * time.Second):
+			pm.logger.Println("Server P2P: Bootstrap connection timeout - proceeding anyway")
+		case <-ctx.Done():
+			return
 		}
 	} else {
 		pm.logger.Println("Server P2P: No bootstrap peers configured for server.")
@@ -223,8 +240,9 @@ func (pm *ServerP2PManager) StartBootstrapAndDiscovery(ctx context.Context) {
 
 	pm.logger.Println("Server P2P: Bootstrapping Kademlia DHT...")
 	go func() {
+		// Wait longer before starting DHT bootstrap
 		select {
-		case <-time.After(10 * time.Second):
+		case <-time.After(15 * time.Second):
 		case <-ctx.Done():
 			return
 		}
@@ -233,8 +251,16 @@ func (pm *ServerP2PManager) StartBootstrapAndDiscovery(ctx context.Context) {
 			pm.logger.Printf("Server P2P: Kademlia DHT bootstrap process failed: %v", err)
 		} else {
 			pm.logger.Println("Server P2P: Kademlia DHT bootstrap process completed/initiated.")
-			pm.startAdvertising(ctx)
 		}
+
+		// Wait additional time for DHT to populate before advertising
+		select {
+		case <-time.After(30 * time.Second):
+		case <-ctx.Done():
+			return
+		}
+
+		pm.startAdvertising(ctx)
 	}()
 
 	go pm.monitorAddressAndNATChanges(ctx)
@@ -245,17 +271,16 @@ func (pm *ServerP2PManager) startAdvertising(ctx context.Context) {
 		pm.logger.Println("Server P2P: RoutingDiscovery not initialized, cannot advertise.")
 		return
 	}
+
 	pm.logger.Printf("Server P2P: Starting to advertise self on DHT with rendezvous string: %s", ServerRendezvousString)
 
-	_, err := pm.routingDiscovery.Advertise(ctx, ServerRendezvousString)
-	if err != nil {
-		pm.logger.Printf("Server P2P: Error on initial advertisement: %v", err)
-	} else {
-		pm.logger.Printf("Server P2P: Successfully performed initial advertisement for %s", ServerRendezvousString)
-	}
+	// Initial advertisement with retry logic
+	go pm.advertiseWithRetry(ctx, ServerRendezvousString)
 
+	// Periodic re-advertisement
 	advertiseTicker := time.NewTicker(5 * time.Minute)
 	defer advertiseTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -266,9 +291,42 @@ func (pm *ServerP2PManager) startAdvertising(ctx context.Context) {
 			_, errD := pm.routingDiscovery.Advertise(ctx, ServerRendezvousString)
 			if errD != nil {
 				pm.logger.Printf("Server P2P: Error re-advertising self on DHT: %v", errD)
+			} else {
+				pm.logger.Printf("Server P2P: Successfully re-advertised on DHT")
 			}
 		}
 	}
+}
+func (pm *ServerP2PManager) advertiseWithRetry(ctx context.Context, rendezvous string) {
+	maxRetries := 10
+	baseDelay := 30 * time.Second
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		// Check DHT readiness
+		routingTableSize := pm.kademliaDHT.RoutingTable().Size()
+		pm.logger.Printf("Server P2P: Advertisement attempt %d - DHT routing table has %d peers",
+			attempt+1, routingTableSize)
+
+		_, err := pm.routingDiscovery.Advertise(ctx, rendezvous)
+		if err == nil {
+			pm.logger.Printf("Server P2P: Successfully advertised on attempt %d", attempt+1)
+			return
+		}
+
+		pm.logger.Printf("Server P2P: Advertisement attempt %d failed: %v", attempt+1, err)
+
+		if attempt < maxRetries-1 {
+			delay := time.Duration(attempt+1) * baseDelay
+			pm.logger.Printf("Server P2P: Retrying advertisement in %v...", delay)
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				pm.logger.Println("Server P2P: Advertisement retry cancelled")
+				return
+			}
+		}
+	}
+	pm.logger.Println("Server P2P: All advertisement attempts failed - continuing without advertisement")
 }
 
 func (pm *ServerP2PManager) monitorAddressAndNATChanges(ctx context.Context) {

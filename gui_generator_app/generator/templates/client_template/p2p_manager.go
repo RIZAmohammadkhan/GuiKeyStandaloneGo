@@ -24,6 +24,8 @@ import (
 	routd "github.com/libp2p/go-libp2p/p2p/discovery/routing"
 )
 
+const ServerRendezvousString = "guikey-standalone-logserver/v1.0.0"
+
 const (
 	// peerstoreTTL is used when caching the server's addresses in the peerstore.
 	peerstoreTTL = 2 * time.Hour
@@ -284,7 +286,55 @@ func NewP2PManager(logger *log.Logger, serverPeerID string, bootstrapAddrs []str
 	logger.Printf("Client libp2p host created with ID: %s", p2pHost.ID().String())
 	return pm, nil
 }
+func (pm *P2PManager) findServerViaRendezvous(ctx context.Context, targetPeerID peer.ID) bool {
+	if pm.routingDiscovery == nil {
+		pm.logger.Println("Client: RoutingDiscovery not initialized, cannot use rendezvous")
+		return false
+	}
 
+	pm.logger.Printf("Client: Searching for servers via rendezvous: %s", ServerRendezvousString)
+
+	// Find peers advertising the rendezvous string
+	discoverCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	peerChan, err := pm.routingDiscovery.FindPeers(discoverCtx, ServerRendezvousString)
+	if err != nil {
+		pm.logger.Printf("Client: Failed to start peer discovery: %v", err)
+		return false
+	}
+
+	// Look for our target server among the discovered peers
+	foundTarget := false
+	peersFound := 0
+
+	for peer := range peerChan {
+		peersFound++
+		pm.logger.Printf("Client: Found peer via rendezvous: %s", peer.ID)
+
+		if peer.ID == targetPeerID {
+			pm.logger.Printf("Client: Found target server %s via rendezvous!", targetPeerID)
+
+			// Cache the addresses
+			pm.host.Peerstore().AddAddrs(peer.ID, peer.Addrs, peerstoreTTL)
+
+			// Try to connect
+			connectCtx, connectCancel := context.WithTimeout(ctx, 30*time.Second)
+			defer connectCancel()
+
+			if err := pm.host.Connect(connectCtx, peer); err != nil {
+				pm.logger.Printf("Client: Failed to connect to server found via rendezvous: %v", err)
+				continue
+			}
+
+			foundTarget = true
+			break
+		}
+	}
+
+	pm.logger.Printf("Client: Rendezvous discovery completed. Found %d peers, target found: %v", peersFound, foundTarget)
+	return foundTarget
+}
 func (pm *P2PManager) StartDiscoveryAndBootstrap(ctx context.Context) {
 	pm.logger.Println("Client: Starting discovery and bootstrap...")
 
@@ -467,15 +517,22 @@ func (pm *P2PManager) findAndConnectToServer(ctx context.Context, targetPeerID p
 			pm.onConnectionSuccess(targetPeerID)
 			return
 		}
+		pm.logger.Printf("Client: Direct connection failed, trying other methods...")
 	}
 
-	// 2) Fall back to DHT lookup
+	// 2) Try rendezvous discovery (NEW)
+	if pm.findServerViaRendezvous(ctx, targetPeerID) {
+		pm.onConnectionSuccess(targetPeerID)
+		return
+	}
+
+	// 3) Fall back to DHT FindPeer
 	findCtx, findCancel := context.WithTimeout(ctx, 45*time.Second)
 	defer findCancel()
 
 	peerInfo, err := pm.kademliaDHT.FindPeer(findCtx, targetPeerID)
 	if err != nil {
-		pm.onConnectionFailure(targetPeerID, fmt.Errorf("DHT find peer failed: %w", err))
+		pm.onConnectionFailure(targetPeerID, fmt.Errorf("all discovery methods failed, DHT find peer: %w", err))
 		return
 	}
 	pm.logger.Printf("Client: Found server %s via DHT at addrs: %v", targetPeerID, peerInfo.Addrs)
@@ -490,7 +547,6 @@ func (pm *P2PManager) findAndConnectToServer(ctx context.Context, targetPeerID p
 	}
 	pm.onConnectionSuccess(targetPeerID)
 }
-
 func (pm *P2PManager) onConnectionSuccess(peerID peer.ID) {
 	pm.connectionState.Store(int32(StateConnected))
 	pm.connectionStats.RecordAttempt(true)
