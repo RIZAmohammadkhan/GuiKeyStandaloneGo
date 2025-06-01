@@ -1,12 +1,10 @@
-// File: GuiKeyStandaloneGo/generator/templates/client_template/p2p_manager.go
 package main
 
 import (
 	"context"
 	"fmt"
-	"log"
-	"math"
-	"math/rand"
+	"log" // Kept for Min in shouldAttemptConnection if you decide to use consecutiveFailures there, but not strictly needed for the 2-min fixed delay
+	// No longer needed for BackoffManager, but might be used elsewhere
 	"os"
 	"sync"
 	"sync/atomic"
@@ -75,37 +73,21 @@ func (cs *ConnectionStats) GetStats() (total, success, failed, consecutive int64
 		cs.consecutiveFailures, cs.lastSuccess, cs.lastFailure
 }
 
-// BackoffManager handles exponential backoff with jitter
+// BackoffManager handles fixed delay retries.
 type BackoffManager struct {
-	baseDelay     time.Duration
-	maxDelay      time.Duration
-	backoffFactor float64
-	jitterFactor  float64
-	attempts      int64 // only increment on genuine failures
+	fixedDelay time.Duration
 }
 
+// NewBackoffManager creates a BackoffManager with a fixed 2-minute delay.
 func NewBackoffManager() *BackoffManager {
 	return &BackoffManager{
-		baseDelay:     1 * time.Second,
-		maxDelay:      5 * time.Minute,
-		backoffFactor: 2.0,
-		jitterFactor:  0.1,
+		fixedDelay: 2 * time.Minute,
 	}
 }
 
-// Failure returns the next delay after a genuine failure (and increments attempts).
-func (bm *BackoffManager) Failure() time.Duration {
-	idx := atomic.AddInt64(&bm.attempts, 1) - 1
-	delay := float64(bm.baseDelay) * math.Pow(bm.backoffFactor, float64(idx))
-	if delay > float64(bm.maxDelay) {
-		delay = float64(bm.maxDelay)
-	}
-	jitter := delay * bm.jitterFactor * (2*rand.Float64() - 1)
-	return time.Duration(delay + jitter)
-}
-
-func (bm *BackoffManager) Reset() {
-	atomic.StoreInt64(&bm.attempts, 0)
+// GetDelay returns the configured fixed delay.
+func (bm *BackoffManager) GetDelay() time.Duration {
+	return bm.fixedDelay
 }
 
 // StreamPool manages reusable streams to reduce connection overhead
@@ -256,7 +238,6 @@ func NewP2PManager(logger *log.Logger, serverPeerID string, bootstrapAddrs []str
 		libp2p.Routing(func(h host.Host) (routing.PeerRouting, error) {
 			var err error
 			dhtOpts := []dht.Option{dht.Mode(dht.ModeClient)}
-			// Bootstrap peers are now primarily for the main host. DHT will use them if connected.
 			kadDHT, err = dht.New(context.Background(), h, dhtOpts...)
 			return kadDHT, err
 		}),
@@ -279,12 +260,12 @@ func NewP2PManager(logger *log.Logger, serverPeerID string, bootstrapAddrs []str
 		serverPeerIDStr:     serverPeerID,
 		bootstrapAddrInfos:  bootAddrsInfo,
 		connectionStats:     &ConnectionStats{},
-		backoffManager:      NewBackoffManager(),
-		streamPool:          NewStreamPool(), // Initialize even if not used by SendLogBatch
+		backoffManager:      NewBackoffManager(), // Use new BackoffManager
+		streamPool:          NewStreamPool(),
 		ctx:                 ctx,
 		cancel:              cancel,
 		healthCheckInterval: 30 * time.Second,
-		rateLimiter:         make(chan struct{}, 10), // Max 10 concurrent SendLogBatch calls
+		rateLimiter:         make(chan struct{}, 10),
 	}
 	pm.connectionState.Store(int32(StateDisconnected))
 
@@ -334,7 +315,6 @@ func (pm *P2PManager) findServerViaRendezvous(ctx context.Context, targetPeerID 
 					pm.host.Peerstore().AddAddrs(pi.ID, pi.Addrs, peerstoreTTL)
 					pm.logger.Printf("Client: Added/updated addresses for target server %s in peerstore.", targetPeerID)
 
-					// Attempt to connect immediately if addresses found
 					connectCtx, connectCancel := context.WithTimeout(ctx, 15*time.Second)
 					if err := pm.host.Connect(connectCtx, pi); err == nil {
 						pm.logger.Printf("Client: Successfully connected to server %s found via rendezvous.", targetPeerID)
@@ -343,17 +323,12 @@ func (pm *P2PManager) findServerViaRendezvous(ctx context.Context, targetPeerID 
 						pm.logger.Printf("Client: Failed to connect to server %s found via rendezvous: %v", targetPeerID, err)
 					}
 					connectCancel()
-					// If connected, we can stop searching
 					if foundTarget {
 						return true
 					}
 				} else {
 					pm.logger.Printf("Client: Target server %s found via rendezvous but no addresses advertised with it.", targetPeerID)
 				}
-				// Even if connection failed or no addrs, we found it. If other methods fail, DHT might resolve it later.
-				// For this function's purpose, we can consider it found conceptually.
-				// Set foundTarget true if we want to prioritize this method even if immediate connect fails.
-				// For now, only true if connect succeeds.
 			}
 		}
 	}
@@ -365,12 +340,9 @@ func (pm *P2PManager) StartDiscoveryAndBootstrap(ctx context.Context) {
 		pm.logger.Println("Client: No bootstrap peers; DHT will be limited")
 	}
 
-	// Initial attempt to connect to any bootstrap peers
-	// This makes the DHT bootstrap more effective if connections are live.
 	pm.connectToBootstrapPeers(ctx)
 
-	// Now start the managers
-	pm.shutdownWg.Add(4) // bootstrapManager, serverConnectionManager, addressMonitor, cleanupManager
+	pm.shutdownWg.Add(4)
 	go pm.bootstrapManager()
 	go pm.serverConnectionManager()
 	go pm.addressMonitor()
@@ -381,15 +353,12 @@ func (pm *P2PManager) bootstrapManager() {
 	defer pm.shutdownWg.Done()
 	defer pm.logger.Println("Client: Bootstrap manager stopped")
 
-	// Initial delay before first DHT bootstrap, allows host to settle and connect to some peers.
 	initialTimer := time.NewTimer(30 * time.Second)
 	defer initialTimer.Stop()
 
-	// Ticker for retrying connections to bootstrap peers if they drop.
 	retryTicker := time.NewTicker(3 * time.Minute)
 	defer retryTicker.Stop()
 
-	// Ticker for periodic DHT refresh/bootstrap.
 	dhtTicker := time.NewTicker(15 * time.Minute)
 	defer dhtTicker.Stop()
 
@@ -406,7 +375,6 @@ func (pm *P2PManager) bootstrapManager() {
 					pm.logger.Printf("Client: Initial DHT bootstrap failed: %v", err)
 				} else {
 					pm.logger.Println("Client: Initial DHT bootstrap process completed/initiated.")
-					// Initialize RoutingDiscovery after first DHT bootstrap attempt
 					if pm.routingDiscovery == nil {
 						pm.routingDiscovery = routd.NewRoutingDiscovery(pm.kademliaDHT)
 						pm.logger.Println("Client: RoutingDiscovery initialized.")
@@ -441,11 +409,9 @@ func (pm *P2PManager) connectToBootstrapPeers(ctx context.Context) {
 	pm.logger.Printf("Client: Attempting to connect to %d bootstrap peers...", len(pm.bootstrapAddrInfos))
 
 	var wg sync.WaitGroup
-	// Limit concurrent dials to avoid overwhelming the system or network.
-	semaphore := make(chan struct{}, 5) // Max 5 concurrent dials
+	semaphore := make(chan struct{}, 5)
 
 	for _, pi := range pm.bootstrapAddrInfos {
-		// Skip if already connected to this peer
 		if pm.host.Network().Connectedness(pi.ID) == network.Connected {
 			continue
 		}
@@ -456,15 +422,15 @@ func (pm *P2PManager) connectToBootstrapPeers(ctx context.Context) {
 			select {
 			case semaphore <- struct{}{}:
 				defer func() { <-semaphore }()
-			case <-ctx.Done(): // Check if context was cancelled before starting
+			case <-ctx.Done():
 				return
 			}
 
-			connectCtx, cancel := context.WithTimeout(ctx, 30*time.Second) // Timeout for this specific connection attempt
+			connectCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 			defer cancel()
 
 			if err := pm.host.Connect(connectCtx, peerInfo); err != nil {
-				if ctx.Err() == nil { // Log only if the main context isn't done
+				if ctx.Err() == nil {
 					pm.logger.Printf("Client: Failed to connect to bootstrap peer %s: %v", peerInfo.ID, err)
 				}
 			} else {
@@ -482,7 +448,7 @@ func (pm *P2PManager) connectToBootstrapPeers(ctx context.Context) {
 	select {
 	case <-done:
 		pm.logger.Println("Client: Bootstrap connection attempts phase completed.")
-	case <-time.After(2 * time.Minute): // Overall timeout for all bootstrap connections
+	case <-time.After(2 * time.Minute):
 		pm.logger.Println("Client: Bootstrap connection attempts overall timeout reached.")
 	case <-ctx.Done():
 		pm.logger.Println("Client: Bootstrap connection attempts cancelled by context.")
@@ -505,19 +471,17 @@ func (pm *P2PManager) serverConnectionManager() {
 		return
 	}
 
-	// Ticker for periodic health checks/connection attempts.
 	ticker := time.NewTicker(pm.healthCheckInterval)
 	defer ticker.Stop()
 
-	// Perform an initial connection attempt fairly quickly after startup.
-	initialCheckTimer := time.NewTimer(15 * time.Second) // Give some time for DHT bootstrap to kick in
+	initialCheckTimer := time.NewTimer(15 * time.Second)
 	defer initialCheckTimer.Stop()
 
 	for {
 		select {
 		case <-pm.ctx.Done():
 			return
-		case <-initialCheckTimer.C: // Use up the timer for the first check
+		case <-initialCheckTimer.C:
 			if pm.shouldAttemptConnection(targetPeerID) {
 				pm.findAndConnectToServer(pm.ctx, targetPeerID)
 			}
@@ -530,38 +494,21 @@ func (pm *P2PManager) serverConnectionManager() {
 }
 
 func (pm *P2PManager) shouldAttemptConnection(targetPeerID peer.ID) bool {
-	// If already connected and last contact was recent (within health check interval), likely okay.
 	if pm.host.Network().Connectedness(targetPeerID) == network.Connected {
-		if time.Since(pm.lastServerContact) < pm.healthCheckInterval { // More aggressive check
+		if time.Since(pm.lastServerContact) < pm.healthCheckInterval {
 			return false
 		}
 		pm.logger.Printf("Client: Connected to server %s, but last contact was > %v ago. Will try to re-verify.", targetPeerID, pm.healthCheckInterval)
 	}
 
-	// Check backoff: if we failed recently, wait for the backoff period.
 	_, _, _, consecutiveFailures, _, lastFailureTime := pm.connectionStats.GetStats()
 	if consecutiveFailures > 0 {
-		// Important: Use backoffManager.attempts, not consecutiveFailures for calculating delay
-		// as Failure() increments attempts. We need the *next* delay based on current attempts.
-		// To get current delay for current attempts, we'd calculate based on `atomic.LoadInt64(&bm.attempts)`.
-		// For now, let's assume lastFailureTime implies a backoff was set *after* that failure.
-		// The backoffManager.Failure() call in onConnectionFailure calculates the *next* delay.
-		// Here, we are checking if enough time has passed since the *last failure*.
-		// A better way: store the *next retry time* instead of just last failure.
-		// For simplicity now, use a fixed delay for retrying after a failure if backoff is active.
-		// Let's use the BaseDelay as a minimum wait after any failure.
-		// A proper backoff strategy would involve `pm.backoffManager.NextDelay()` (if it existed)
-		// or calculating it based on current `pm.backoffManager.attempts`.
-
-		// Simplified: if there was a failure, wait at least baseDelay before retrying.
-		// The `pm.backoffManager.Failure()` in `onConnectionFailure` actually calculates the *next* backoff.
-		// If time since lastFailure < calculated backoff time for that failure, then don't retry.
-		// This is complex to get right without storing the calculated backoff time.
-		// Let's assume onConnectionFailure sets the state to StateFailed, and we retry on ticker.
-		// The backoffManager.Failure() in onConnectionFailure effectively logs the *next* delay.
-		// This check is more about "should we even try now or is it too soon after a failure".
-		// If the time since last failure is less than the base delay, probably too soon.
-		if time.Since(lastFailureTime) < pm.backoffManager.baseDelay*time.Duration(math.Min(float64(consecutiveFailures), 5)) { // Basic linear backoff for check
+		// If there were recent failures, wait for the fixed delay period (2 minutes)
+		// since the last failure before attempting again.
+		if time.Since(lastFailureTime) < pm.backoffManager.GetDelay() {
+			// Optional: Log that we are waiting. Can be noisy.
+			// pm.logger.Printf("Client: Waiting for retry delay. %v remaining before next attempt to %s.",
+			//	pm.backoffManager.GetDelay()-time.Since(lastFailureTime), targetPeerID)
 			return false
 		}
 	}
@@ -570,14 +517,13 @@ func (pm *P2PManager) shouldAttemptConnection(targetPeerID peer.ID) bool {
 
 func (pm *P2PManager) findAndConnectToServer(ctx context.Context, targetPeerID peer.ID) {
 	currentState := ConnectionState(pm.connectionState.Load())
-	if currentState == StateConnecting && ctx.Err() == nil { // Avoid re-entry if not cancelled
+	if currentState == StateConnecting && ctx.Err() == nil {
 		pm.logger.Println("Client: Connection attempt already in progress.")
 		return
 	}
 	pm.connectionState.Store(int32(StateConnecting))
 	pm.logger.Printf("Client: Attempting to find and connect to server %s...", targetPeerID)
 
-	// 1. Try direct connection if addresses are already in peerstore (cached from previous success or bootstrap).
 	if addrs := pm.host.Peerstore().Addrs(targetPeerID); len(addrs) > 0 {
 		pm.logger.Printf("Client: Server %s has addresses in peerstore: %v. Attempting direct connect.", targetPeerID, addrs)
 		connectCtx, cancelDirect := context.WithTimeout(ctx, 15*time.Second)
@@ -592,17 +538,13 @@ func (pm *P2PManager) findAndConnectToServer(ctx context.Context, targetPeerID p
 		pm.logger.Printf("Client: No cached addresses for server %s in peerstore.", targetPeerID)
 	}
 
-	// 2. Try rendezvous discovery (if routingDiscovery is initialized).
 	if pm.routingDiscovery != nil {
 		pm.logger.Printf("Client: Attempting to find server %s via rendezvous...", targetPeerID)
-		rendezvousCtx, cancelRdz := context.WithTimeout(ctx, 30*time.Second) // Timeout for rendezvous attempt
+		rendezvousCtx, cancelRdz := context.WithTimeout(ctx, 30*time.Second)
 		if pm.findServerViaRendezvous(rendezvousCtx, targetPeerID) {
-			// findServerViaRendezvous itself attempts connection and calls onConnectionSuccess if it works
-			// So, if it returns true, we assume connection was successful or addresses were added.
-			// Check connectedness again.
 			cancelRdz()
 			if pm.host.Network().Connectedness(targetPeerID) == network.Connected {
-				pm.onConnectionSuccess(targetPeerID) // Ensure state is updated if findServerViaRendezvous connected
+				pm.onConnectionSuccess(targetPeerID)
 				return
 			}
 			pm.logger.Printf("Client: Rendezvous found server %s, but not connected. Will proceed to DHT FindPeer.", targetPeerID)
@@ -614,11 +556,10 @@ func (pm *P2PManager) findAndConnectToServer(ctx context.Context, targetPeerID p
 		pm.logger.Println("Client: RoutingDiscovery not available, skipping rendezvous.")
 	}
 
-	// 3. Fall back to DHT FindPeer.
 	pm.logger.Printf("Client: Attempting DHT FindPeer for server %s...", targetPeerID)
-	findCtx, findCancel := context.WithTimeout(ctx, 45*time.Second) // Timeout for DHT FindPeer
+	findCtx, findCancel := context.WithTimeout(ctx, 45*time.Second)
 	peerInfo, err := pm.kademliaDHT.FindPeer(findCtx, targetPeerID)
-	findCancel() // Release resources for findCtx
+	findCancel()
 
 	if err != nil {
 		pm.onConnectionFailure(targetPeerID, fmt.Errorf("all discovery methods failed; DHT FindPeer for %s: %w", targetPeerID, err))
@@ -630,10 +571,10 @@ func (pm *P2PManager) findAndConnectToServer(ctx context.Context, targetPeerID p
 		pm.onConnectionFailure(targetPeerID, fmt.Errorf("DHT FindPeer for %s succeeded but returned no addresses", targetPeerID))
 		return
 	}
-	pm.host.Peerstore().AddAddrs(peerInfo.ID, peerInfo.Addrs, peerstoreTTL) // Cache addresses
+	pm.host.Peerstore().AddAddrs(peerInfo.ID, peerInfo.Addrs, peerstoreTTL)
 
 	pm.logger.Printf("Client: Attempting to connect to server %s using addresses from DHT.", targetPeerID)
-	connectCtx, connectCancel := context.WithTimeout(ctx, 30*time.Second) // Timeout for connection attempt
+	connectCtx, connectCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer connectCancel()
 	if err := pm.host.Connect(connectCtx, peerInfo); err != nil {
 		pm.onConnectionFailure(targetPeerID, fmt.Errorf("dial to %s (addrs from DHT) failed: %w", targetPeerID, err))
@@ -645,24 +586,23 @@ func (pm *P2PManager) findAndConnectToServer(ctx context.Context, targetPeerID p
 
 func (pm *P2PManager) onConnectionSuccess(peerID peer.ID) {
 	pm.connectionState.Store(int32(StateConnected))
-	pm.connectionStats.RecordAttempt(true)
-	pm.backoffManager.Reset() // Reset backoff on successful connection
+	pm.connectionStats.RecordAttempt(true) // This resets consecutiveFailures
+	// pm.backoffManager.Reset() // No longer needed
 
-	pm.lastServerContact = time.Now() // Update last contact time
+	pm.lastServerContact = time.Now()
 	pm.logger.Printf("Client: Successfully connected to server %s", peerID)
 }
 
 func (pm *P2PManager) onConnectionFailure(peerID peer.ID, err error) {
 	pm.connectionState.Store(int32(StateFailed))
-	// Calculate and log the backoff for the *next* attempt.
+	// Get the fixed retry delay for logging purposes.
 	// The actual waiting happens due to the ticker in serverConnectionManager
 	// and the shouldAttemptConnection logic.
-	nextBackoffDuration := pm.backoffManager.Failure()
-	pm.connectionStats.RecordAttempt(false)
+	retryDelay := pm.backoffManager.GetDelay()
+	pm.connectionStats.RecordAttempt(false) // This increments consecutiveFailures and updates lastFailureTime
 
-	// Only log if the context isn't already cancelled (i.e., not shutting down)
 	if pm.ctx.Err() == nil {
-		pm.logger.Printf("Client: Failed to connect/find server %s: %v (next retry attempt after ~%s)", peerID, err, nextBackoffDuration)
+		pm.logger.Printf("Client: Failed to connect/find server %s: %v (will retry after ~%s if still disconnected)", peerID, err, retryDelay)
 	}
 }
 
@@ -670,7 +610,6 @@ func (pm *P2PManager) addressMonitor() {
 	defer pm.shutdownWg.Done()
 	defer pm.logger.Println("Client: Address monitor stopped")
 
-	// Subscribe to address update events.
 	addrSub, err := pm.host.EventBus().Subscribe(new(event.EvtLocalAddressesUpdated))
 	if err != nil {
 		pm.logger.Printf("Client: Failed to subscribe to address updates: %v", err)
@@ -678,11 +617,9 @@ func (pm *P2PManager) addressMonitor() {
 	}
 	defer addrSub.Close()
 
-	// Subscribe to reachability change events.
 	reachabilitySub, err := pm.host.EventBus().Subscribe(new(event.EvtLocalReachabilityChanged))
 	if err != nil {
 		pm.logger.Printf("Client: Failed to subscribe to reachability events: %v", err)
-		// Continue without reachability events if subscription fails
 		reachabilitySub = nil
 	} else {
 		defer reachabilitySub.Close()
@@ -690,14 +627,12 @@ func (pm *P2PManager) addressMonitor() {
 
 	pm.logger.Printf("Client: Initial listen addresses: %v", pm.host.Addrs())
 
-	// Get the channels once to avoid repeated function calls
 	var addrChan <-chan interface{}
 	var reachabilityChan <-chan interface{}
 
 	if addrSub != nil {
 		addrChan = addrSub.Out()
 	}
-
 	if reachabilitySub != nil {
 		reachabilityChan = reachabilitySub.Out()
 	}
@@ -706,45 +641,35 @@ func (pm *P2PManager) addressMonitor() {
 		select {
 		case <-pm.ctx.Done():
 			return
-
 		case ev, ok := <-addrChan:
 			if !ok {
 				pm.logger.Println("Client: Address subscription closed")
-				addrChan = nil // Set to nil to disable this case
-				// If both channels are nil, exit
+				addrChan = nil
 				if reachabilityChan == nil {
 					return
 				}
 				continue
 			}
-
 			addressEvent := ev.(event.EvtLocalAddressesUpdated)
 			pm.logger.Printf("Client: Addresses updated. Current: %v", len(addressEvent.Current))
-
-			// Log current addresses
 			for _, addr := range addressEvent.Current {
 				pm.logger.Printf("Client: Current address: %v (Action: %v)", addr.Address, addr.Action)
 			}
-
-			// Log removed addresses if diffs are available
 			if addressEvent.Diffs && len(addressEvent.Removed) > 0 {
 				pm.logger.Println("Client: Removed addresses:")
 				for _, addr := range addressEvent.Removed {
 					pm.logger.Printf("Client: Removed address: %v", addr.Address)
 				}
 			}
-
 		case ev, ok := <-reachabilityChan:
 			if !ok {
 				pm.logger.Println("Client: Reachability subscription closed")
-				reachabilityChan = nil // Set to nil to disable this case
-				// If both channels are nil, exit
+				reachabilityChan = nil
 				if addrChan == nil {
 					return
 				}
 				continue
 			}
-
 			reachabilityEvent := ev.(event.EvtLocalReachabilityChanged)
 			pm.logger.Printf("Client: Reachability changed: %s",
 				reachabilityEvent.Reachability.String())
@@ -755,7 +680,7 @@ func (pm *P2PManager) cleanupManager() {
 	defer pm.shutdownWg.Done()
 	defer pm.logger.Println("Client: Cleanup manager stopped")
 
-	ticker := time.NewTicker(5 * time.Minute) // Periodically clean up stream pool
+	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 
 	for {
@@ -763,22 +688,18 @@ func (pm *P2PManager) cleanupManager() {
 		case <-pm.ctx.Done():
 			return
 		case <-ticker.C:
-			pm.streamPool.Cleanup() // Clean up any old/closed streams from the general pool
+			pm.streamPool.Cleanup()
 		}
 	}
 }
 
-// SendLogBatch sends client’s log batch to server.
-// It will now ALWAYS create a new stream and not use the pool for this operation
-// because the server closes the stream after each request.
 func (pm *P2PManager) SendLogBatch(ctx context.Context, clientAppID string, encryptedPayload []byte) (*p2p.LogBatchResponse, error) {
-	// Rate limiting
 	select {
 	case pm.rateLimiter <- struct{}{}:
 		defer func() { <-pm.rateLimiter }()
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case <-time.After(5 * time.Second): // Timeout for acquiring a rate limit slot
+	case <-time.After(5 * time.Second):
 		return nil, fmt.Errorf("rate limit exceeded: too many concurrent SendLogBatch requests")
 	}
 
@@ -790,34 +711,27 @@ func (pm *P2PManager) SendLogBatch(ctx context.Context, clientAppID string, encr
 		return nil, fmt.Errorf("invalid server PeerID '%s': %w", pm.serverPeerIDStr, err)
 	}
 
-	// Check if connected to the server.
 	if pm.host.Network().Connectedness(targetPeerID) != network.Connected {
 		pm.logger.Printf("Client: Not connected to server %s. SendLogBatch will fail. Connection manager should handle reconnection.", targetPeerID)
 		return nil, fmt.Errorf("not connected to server %s", targetPeerID)
 	}
 
-	// ALWAYS create a new stream for this request-response protocol.
-	streamCtx, cancelStreamOpen := context.WithTimeout(ctx, 30*time.Second) // Timeout for opening the stream
+	streamCtx, cancelStreamOpen := context.WithTimeout(ctx, 30*time.Second)
 	stream, err := pm.host.NewStream(streamCtx, targetPeerID, p2p.ProtocolID)
-	cancelStreamOpen() // Release resources associated with streamCtx once NewStream returns
+	cancelStreamOpen()
 
 	if err != nil {
-		// No need to use pm.streamPool.Remove as we are not using the pool here.
 		return nil, fmt.Errorf("failed to open new stream to server %s: %w", targetPeerID, err)
 	}
 	pm.logger.Printf("Client: Created new stream to server %s for LogBatch", targetPeerID)
-
-	// Ensure stream is reset (more forceful than close) when done with this specific operation.
 	defer stream.Reset()
 
-	// Build and send request
 	req := p2p.LogBatchRequest{
 		Header:              p2p.NewMessageHeader(p2p.MessageTypeLogBatch),
 		AppClientID:         clientAppID,
 		EncryptedLogPayload: encryptedPayload,
 	}
 
-	// Set deadline for writing the request
 	if err := stream.SetWriteDeadline(time.Now().Add(30 * time.Second)); err != nil {
 		return nil, fmt.Errorf("failed to set write deadline for LogBatchRequest: %w", err)
 	}
@@ -825,7 +739,6 @@ func (pm *P2PManager) SendLogBatch(ctx context.Context, clientAppID string, encr
 		return nil, fmt.Errorf("failed to write LogBatchRequest: %w", err)
 	}
 
-	// Set deadline for reading the response
 	if err := stream.SetReadDeadline(time.Now().Add(60 * time.Second)); err != nil {
 		return nil, fmt.Errorf("failed to set read deadline for LogBatchResponse: %w", err)
 	}
@@ -834,41 +747,30 @@ func (pm *P2PManager) SendLogBatch(ctx context.Context, clientAppID string, encr
 		return nil, fmt.Errorf("failed to read LogBatchResponse: %w", err)
 	}
 
-	// Validate message type
 	if resp.Header.MessageType != p2p.MessageTypeLogBatch && resp.Header.MessageType != p2p.MessageTypeError {
 		return nil, fmt.Errorf("unexpected response message type: %s (RequestID: %s)", resp.Header.MessageType, req.Header.RequestID)
 	}
 
-	// Validate RequestID matches
 	if resp.Header.RequestID != req.Header.RequestID {
 		return nil, fmt.Errorf("response RequestID mismatch: expected %s, got %s",
 			req.Header.RequestID, resp.Header.RequestID)
 	}
 
-	// If the send was successful and we got a valid response, update last contact time.
 	pm.lastServerContact = time.Now()
 	pm.logger.Printf("Client: Successfully sent batch and received response from server %s. Updated last contact time.", targetPeerID)
 
 	return &resp, nil
 }
 
-// GetConnectionStats returns the current ConnectionState and stats object.
 func (pm *P2PManager) GetConnectionStats() (ConnectionState, *ConnectionStats) {
 	state := ConnectionState(pm.connectionState.Load())
-	// Create a copy of stats to avoid race conditions if the caller modifies it,
-	// though RWMutex in ConnectionStats mostly protects its internal fields.
-	// For simplicity, direct return is fine if caller treats it as read-only.
 	return state, pm.connectionStats
 }
 
-// Close gracefully shuts down background goroutines, DHT, and host.
 func (pm *P2PManager) Close() error {
 	pm.logger.Println("Client: Shutting down P2P Manager...")
-
-	// Cancel context to signal all managed goroutines to stop.
 	pm.cancel()
 
-	// Wait for background goroutines to finish.
 	done := make(chan struct{})
 	go func() {
 		pm.shutdownWg.Wait()
@@ -878,14 +780,12 @@ func (pm *P2PManager) Close() error {
 	select {
 	case <-done:
 		pm.logger.Println("Client: All P2P background goroutines stopped.")
-	case <-time.After(10 * time.Second): // Timeout for waiting
+	case <-time.After(10 * time.Second):
 		pm.logger.Println("Client: Timeout waiting for P2P background goroutines to stop.")
 	}
 
-	// Clean up the general purpose stream pool.
 	pm.streamPool.Cleanup()
 
-	// Close Kademlia DHT.
 	if pm.kademliaDHT != nil {
 		pm.logger.Println("Client: Closing Kademlia DHT...")
 		if err := pm.kademliaDHT.Close(); err != nil {
@@ -893,36 +793,26 @@ func (pm *P2PManager) Close() error {
 		}
 	}
 
-	// Close the libp2p host.
 	if pm.host != nil {
 		pm.logger.Println("Client: Closing libp2p host...")
 		if err := pm.host.Close(); err != nil {
 			pm.logger.Printf("Client: Error closing libp2p host: %v", err)
-			return err // Return the host close error if any
+			return err
 		}
 	}
 	pm.logger.Println("Client: P2P Manager shut down complete.")
 	return nil
 }
 
-// runP2PManager is the entry point for running the P2PManager in its own goroutine,
-// managed by the main application's WaitGroup and quit channel.
 func runP2PManager(p2pManager *P2PManager, internalQuit <-chan struct{}, wg *sync.WaitGroup, logger *log.Logger) {
 	defer wg.Done()
 	p2pManager.logger.Println("Client P2P Manager controlling goroutine starting.")
+	p2pManager.StartDiscoveryAndBootstrap(p2pManager.ctx)
 
-	// The P2PManager's internal context (p2pManager.ctx) is used for its own goroutines.
-	// This outer goroutine primarily starts the P2PManager's operations and waits for shutdown.
-	p2pManager.StartDiscoveryAndBootstrap(p2pManager.ctx) // Start its internal goroutines
-
-	// Wait for the main application's quit signal
 	select {
 	case <-internalQuit:
 		p2pManager.logger.Println("Client P2P Manager controlling goroutine: Received internal quit signal.")
-		// The P2PManager's Close method (which calls its internal p2pManager.cancel())
-		// will be called when the main application defer executes.
-		// No explicit call to p2pManager.Close() here, as it's handled by defer in main.
-	case <-p2pManager.ctx.Done(): // If P2PManager's internal context is cancelled for other reasons
+	case <-p2pManager.ctx.Done():
 		p2pManager.logger.Println("Client P2P Manager controlling goroutine: P2PManager internal context done.")
 	}
 	p2pManager.logger.Println("Client P2P Manager controlling goroutine finished.")
